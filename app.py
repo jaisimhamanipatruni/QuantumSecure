@@ -2,183 +2,146 @@ import streamlit as st
 import wntr
 import pandas as pd
 import matplotlib.pyplot as plt
-from pyvis.network import Network
-import tempfile
-import streamlit.components.v1 as components
 
 # -------------------------------
-# PAGE CONFIG
+# Helper functions
 # -------------------------------
-st.set_page_config(
-    page_title="WDN CPS Security Testbed",
-    layout="wide"
-)
+def get_tank_level(results, wn, tank_id):
+    head = results.node["head"].loc[:, tank_id]
+    elevation = wn.get_node(tank_id).elevation
+    return head - elevation
 
-st.markdown(
-    """
-    <h2 style='text-align:center;'>WDN Cyber-Physical Security Experiment Platform</h2>
-    <p style='text-align:center;'>
-    Designed by <b>Jaisimha Manipatruni</b>, IIPE Visakhapatnam
-    </p>
-    <hr>
-    """,
-    unsafe_allow_html=True
-)
+def ieee_plot_style(ax, xlabel, ylabel, title):
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True)
 
 # -------------------------------
-# UPLOAD MODEL
+# Load model
 # -------------------------------
-uploaded_file = st.file_uploader("Upload EPANET (.inp) file", type=["inp"])
-
+uploaded_file = st.file_uploader("Upload EPANET (.inp)", type=["inp"])
 if not uploaded_file:
-    st.info("Upload an EPANET .inp file to begin")
     st.stop()
 
 with open("model.inp", "wb") as f:
     f.write(uploaded_file.getbuffer())
 
-wn_base = wntr.network.WaterNetworkModel("model.inp")
+wn = wntr.network.WaterNetworkModel("model.inp")
 
 # -------------------------------
-# NETWORK VIEW
-# -------------------------------
-st.subheader("Water Distribution Network")
-
-net = Network(height="450px", width="100%", directed=False)
-net.barnes_hut()
-
-for name, node in wn_base.nodes():
-    color = "skyblue"
-    if node.node_type == "Tank":
-        color = "green"
-    elif node.node_type == "Reservoir":
-        color = "red"
-    net.add_node(name, label=f"{name}\n({node.node_type})", color=color)
-
-for name, link in wn_base.links():
-    net.add_edge(link.start_node_name, link.end_node_name, label=name)
-
-tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-net.save_graph(tmp.name)
-components.html(open(tmp.name).read(), height=470)
-
-# -------------------------------
-# EXPERIMENT SETUP
+# Attack configuration
 # -------------------------------
 st.subheader("Attack Configuration")
 
-node_id = st.selectbox("Select Tank for Analysis / Attack", wn_base.tank_name_list)
+component_type = st.selectbox(
+    "Component Type",
+    ["Junction", "Tank", "Pump", "Valve"]
+)
+
+if component_type == "Junction":
+    component_id = st.selectbox("Select Junction", wn.junction_name_list)
+elif component_type == "Tank":
+    component_id = st.selectbox("Select Tank", wn.tank_name_list)
+elif component_type == "Pump":
+    component_id = st.selectbox("Select Pump", wn.pump_name_list)
+else:
+    component_id = st.selectbox("Select Valve", wn.valve_name_list)
 
 attack_type = st.selectbox(
     "Attack Type",
     ["None", "False Data Injection (FDI)", "Denial of Service (DoS)"]
 )
 
-fdi_bias = st.slider("FDI Demand Bias (%)", -80, 80, 40)
-dos_severity = st.slider("DoS Severity (Demand Reduction %)", 0, 100, 80)
+t_start = st.number_input("Attack start time (seconds)", 0, 86400, 3600)
+attack_duration = st.number_input("Attack duration (seconds)", 0, 86400, 3600)
+t_end = t_start + attack_duration
+
+attack_magnitude = st.slider(
+    "Attack Magnitude (%)",
+    -80, 80, 40
+)
 
 # -------------------------------
-# SIMULATION FUNCTION
+# Baseline simulation
 # -------------------------------
-def run_sim(wn):
-    wn.options.time.duration = 24 * 3600
-    wn.options.time.hydraulic_timestep = 3600
-    sim = wntr.sim.EpanetSimulator(wn)
-    return sim.run_sim()
+wn.options.time.duration = 24 * 3600
+wn.options.time.hydraulic_timestep = 3600
+
+baseline_sim = wntr.sim.EpanetSimulator(wn)
+baseline_results = baseline_sim.run_sim()
 
 # -------------------------------
-# PRE-ATTACK SIMULATION
-# -------------------------------
-st.subheader("Running Pre-Attack Simulation")
-pre_results = run_sim(wn_base)
-pre_level = pre_results.node["level"].loc[:, node_id]
-
-# -------------------------------
-# DURING-ATTACK SIMULATION
+# Attack simulation
 # -------------------------------
 wn_attack = wntr.network.WaterNetworkModel("model.inp")
+wn_attack.options.time.duration = 24 * 3600
+wn_attack.options.time.hydraulic_timestep = 3600
 
 if attack_type == "False Data Injection (FDI)":
-    tank = wn_attack.get_node(node_id)
-    tank.base_demand *= (1 + fdi_bias / 100)
+    if component_type in ["Junction", "Tank"]:
+        node = wn_attack.get_node(component_id)
+        node.base_demand *= (1 + attack_magnitude / 100)
 
 elif attack_type == "Denial of Service (DoS)":
-    tank = wn_attack.get_node(node_id)
-    tank.base_demand *= (1 - dos_severity / 100)
+    if component_type in ["Pump", "Valve"]:
+        link = wn_attack.get_link(component_id)
+        control = wntr.network.controls.Control(
+            wntr.network.controls.SimTimeCondition(
+                wn_attack, "=", t_start
+            ),
+            wntr.network.controls.LinkStatusAction(
+                link, 0  # CLOSED / OFF
+            )
+        )
+        wn_attack.add_control(f"DoS_start_{component_id}", control)
 
-st.subheader("Running During-Attack Simulation")
-during_results = run_sim(wn_attack)
-during_level = during_results.node["level"].loc[:, node_id]
+        restore = wntr.network.controls.Control(
+            wntr.network.controls.SimTimeCondition(
+                wn_attack, "=", t_end
+            ),
+            wntr.network.controls.LinkStatusAction(
+                link, 1  # OPEN / ON
+            )
+        )
+        wn_attack.add_control(f"DoS_end_{component_id}", restore)
+
+attack_sim = wntr.sim.EpanetSimulator(wn_attack)
+attack_results = attack_sim.run_sim()
 
 # -------------------------------
-# POST-ATTACK SIMULATION
+# Metric extraction (example: tank)
 # -------------------------------
-st.subheader("Running Post-Attack Simulation")
-post_results = run_sim(wn_base)
-post_level = post_results.node["level"].loc[:, node_id]
+if component_type == "Tank":
+    pre = get_tank_level(baseline_results, wn, component_id)
+    during = get_tank_level(attack_results, wn_attack, component_id)
 
-# -------------------------------
-# PLOTTING
-# -------------------------------
-st.subheader("Tank Level Response")
+    df = pd.DataFrame({
+        "Pre_Attack": pre,
+        "During_Attack": during
+    })
 
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.markdown("**Pre-Attack**")
-    fig, ax = plt.subplots()
-    pre_level.plot(ax=ax, color="blue")
-    ax.set_ylabel("Tank Level")
-    ax.grid(True)
+    # -------------------------------
+    # IEEE-style plot
+    # -------------------------------
+    fig, ax = plt.subplots(figsize=(7,4))
+    pre.plot(ax=ax, label="Pre-Attack")
+    during.plot(ax=ax, label="During Attack", linestyle="--")
+    ieee_plot_style(ax, "Time (s)", "Tank Level (m)",
+                    f"Tank {component_id} Response")
+    ax.legend()
     st.pyplot(fig)
 
-with col2:
-    st.markdown("**During Attack**")
-    fig, ax = plt.subplots()
-    during_level.plot(ax=ax, color="red")
-    ax.set_ylabel("Tank Level")
-    ax.grid(True)
-    st.pyplot(fig)
+    # -------------------------------
+    # Export CSV
+    # -------------------------------
+    st.download_button(
+        "Download IEEE-ready CSV",
+        df.to_csv().encode(),
+        f"{component_id}_{attack_type}.csv",
+        "text/csv"
+    )
 
-with col3:
-    st.markdown("**Post-Attack**")
-    fig, ax = plt.subplots()
-    post_level.plot(ax=ax, color="green")
-    ax.set_ylabel("Tank Level")
-    ax.grid(True)
-    st.pyplot(fig)
-
-# -------------------------------
-# COMPARISON PLOT
-# -------------------------------
-st.subheader("Pre vs During vs Post Comparison")
-
-fig, ax = plt.subplots(figsize=(8,4))
-pre_level.plot(ax=ax, label="Pre-Attack", linewidth=2)
-during_level.plot(ax=ax, label="During Attack", linestyle="--")
-post_level.plot(ax=ax, label="Post-Attack", linestyle=":")
-ax.set_ylabel("Tank Level")
-ax.legend()
-ax.grid(True)
-st.pyplot(fig)
-
-# -------------------------------
-# EXPORT DATA
-# -------------------------------
-st.subheader("Export Results")
-
-df = pd.DataFrame({
-    "Pre_Attack": pre_level,
-    "During_Attack": during_level,
-    "Post_Attack": post_level
-})
-
-st.download_button(
-    "Download CSV (Publication Ready)",
-    df.to_csv().encode(),
-    f"{node_id}_{attack_type.replace(' ', '_')}.csv",
-    "text/csv"
-)
 
 
 
