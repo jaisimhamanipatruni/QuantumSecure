@@ -5,8 +5,6 @@ import matplotlib.pyplot as plt
 from pyvis.network import Network
 import tempfile
 import streamlit.components.v1 as components
-from wntr.network.controls import Control, SimTimeCondition, LinkStatusAction
-
 
 # =====================================================
 # PAGE CONFIG + HEADER
@@ -45,7 +43,7 @@ def run_simulation(wn):
     return sim.run_sim()
 
 # =====================================================
-# UPLOAD MODEL
+# UPLOAD EPANET MODEL
 # =====================================================
 uploaded_file = st.file_uploader("Upload EPANET (.inp) file", type=["inp"])
 
@@ -129,25 +127,25 @@ pre_results = run_simulation(wn_base)
 # =====================================================
 wn_attack = wntr.network.WaterNetworkModel("model.inp")
 
-# ---- FDI (Node demand falsification)
+# ---- FDI (Demand falsification – WNTR legal)
 if attack_type == "False Data Injection (FDI)" and component_type in ["Junction", "Tank"]:
     node = wn_attack.get_node(component_id)
     factor = 1 + attack_magnitude / 100
     node.demand_timeseries_list[0].base_value *= factor
 
-# ---- DoS (Actuator denial using controls)
+# ---- DoS (Time-based actuator denial)
 elif attack_type == "Denial of Service (DoS)" and component_type in ["Pump", "Valve"]:
     link = wn_attack.get_link(component_id)
 
-    dos_start = Control(
-        SimTimeCondition(wn_attack, ">=", t_start),
-        LinkStatusAction(link, 0)
+    dos_start = wntr.network.controls.Control(
+        wntr.network.controls.SimTimeCondition(wn_attack, ">=", t_start),
+        wntr.network.controls.LinkStatusAction(link, 0)
     )
     wn_attack.add_control("dos_start", dos_start)
 
-    dos_end = Control(
-        SimTimeCondition(wn_attack, ">=", t_end),
-        LinkStatusAction(link, 1)
+    dos_end = wntr.network.controls.Control(
+        wntr.network.controls.SimTimeCondition(wn_attack, ">=", t_end),
+        wntr.network.controls.LinkStatusAction(link, 1)
     )
     wn_attack.add_control("dos_end", dos_end)
 
@@ -229,6 +227,7 @@ st.download_button(
     f"{component_id}_{attack_type.replace(' ', '_')}.csv",
     "text/csv"
 )
+
 
 
 
