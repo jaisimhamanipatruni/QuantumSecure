@@ -1,22 +1,34 @@
 import streamlit as st
 import wntr
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 from pyvis.network import Network
 import tempfile
 import streamlit.components.v1 as components
 
 # -------------------------------
-# APP CONFIG
+# PAGE CONFIG
 # -------------------------------
-st.set_page_config(layout="wide")
-st.title("WDN Cyber-Physical Security Experiment Platform")
+st.set_page_config(
+    page_title="WDN CPS Security Testbed",
+    layout="wide"
+)
+
+st.markdown(
+    """
+    <h2 style='text-align:center;'>WDN Cyber-Physical Security Experiment Platform</h2>
+    <p style='text-align:center;'>
+    Designed by <b>Jaisimha Manipatruni</b>, IIPE Visakhapatnam
+    </p>
+    <hr>
+    """,
+    unsafe_allow_html=True
+)
 
 # -------------------------------
 # UPLOAD MODEL
 # -------------------------------
-uploaded_file = st.file_uploader("Upload EPANET .inp file", type=["inp"])
+uploaded_file = st.file_uploader("Upload EPANET (.inp) file", type=["inp"])
 
 if not uploaded_file:
     st.info("Upload an EPANET .inp file to begin")
@@ -25,159 +37,149 @@ if not uploaded_file:
 with open("model.inp", "wb") as f:
     f.write(uploaded_file.getbuffer())
 
-wn = wntr.network.WaterNetworkModel("model.inp")
-st.success("EPANET model loaded")
+wn_base = wntr.network.WaterNetworkModel("model.inp")
 
 # -------------------------------
-# NETWORK VISUALIZATION
+# NETWORK VIEW
 # -------------------------------
 st.subheader("Water Distribution Network")
 
-net = Network(height="500px", width="100%", directed=False)
+net = Network(height="450px", width="100%", directed=False)
 net.barnes_hut()
 
-for name, node in wn.nodes():
-    color = "blue"
+for name, node in wn_base.nodes():
+    color = "skyblue"
     if node.node_type == "Tank":
         color = "green"
     elif node.node_type == "Reservoir":
         color = "red"
     net.add_node(name, label=f"{name}\n({node.node_type})", color=color)
 
-for name, link in wn.links():
+for name, link in wn_base.links():
     net.add_edge(link.start_node_name, link.end_node_name, label=name)
 
 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
 net.save_graph(tmp.name)
-components.html(open(tmp.name).read(), height=520)
+components.html(open(tmp.name).read(), height=470)
 
 # -------------------------------
 # EXPERIMENT SETUP
 # -------------------------------
-st.subheader("Experiment Configuration")
+st.subheader("Attack Configuration")
 
-node_id = st.selectbox("Select node for monitoring / attack", wn.node_name_list)
-node = wn.get_node(node_id)
+node_id = st.selectbox("Select Tank for Analysis / Attack", wn_base.tank_name_list)
 
 attack_type = st.selectbox(
-    "Attack type",
+    "Attack Type",
     ["None", "False Data Injection (FDI)", "Denial of Service (DoS)"]
 )
 
-t_start = st.number_input("Attack start time (hours)", 0.0, 24.0, 6.0)
-t_end = st.number_input("Attack end time (hours)", 0.0, 24.0, 12.0)
-
-fdi_bias = st.slider("FDI bias (%)", -50, 50, 30)
+fdi_bias = st.slider("FDI Demand Bias (%)", -80, 80, 40)
+dos_severity = st.slider("DoS Severity (Demand Reduction %)", 0, 100, 80)
 
 # -------------------------------
-# SIMULATION PARAMETERS
+# SIMULATION FUNCTION
 # -------------------------------
-wn.options.time.duration = 24 * 3600
-wn.options.time.hydraulic_timestep = 3600
+def run_sim(wn):
+    wn.options.time.duration = 24 * 3600
+    wn.options.time.hydraulic_timestep = 3600
+    sim = wntr.sim.EpanetSimulator(wn)
+    return sim.run_sim()
 
 # -------------------------------
-# BASELINE SIMULATION
+# PRE-ATTACK SIMULATION
 # -------------------------------
-sim = wntr.sim.EpanetSimulator(wn)
-baseline = sim.run_sim()
-
-if node.node_type == "Tank":
-    baseline_series = baseline.node["level"].loc[:, node_id]
-    ylabel = "Tank Level"
-else:
-    baseline_series = baseline.node["pressure"].loc[:, node_id]
-    ylabel = "Pressure"
+st.subheader("Running Pre-Attack Simulation")
+pre_results = run_sim(wn_base)
+pre_level = pre_results.node["level"].loc[:, node_id]
 
 # -------------------------------
-# ATTACK SIMULATION
+# DURING-ATTACK SIMULATION
 # -------------------------------
 wn_attack = wntr.network.WaterNetworkModel("model.inp")
-wn_attack.options.time.duration = 24 * 3600
-wn_attack.options.time.hydraulic_timestep = 3600
 
-time_hours = baseline_series.index / 3600
-attack_mask = (time_hours >= t_start) & (time_hours <= t_end)
+if attack_type == "False Data Injection (FDI)":
+    tank = wn_attack.get_node(node_id)
+    tank.base_demand *= (1 + fdi_bias / 100)
 
-attack_series = baseline_series.copy()
+elif attack_type == "Denial of Service (DoS)":
+    tank = wn_attack.get_node(node_id)
+    tank.base_demand *= (1 - dos_severity / 100)
 
-if attack_type != "None" and node.node_type == "Tank":
-
-    if attack_type == "False Data Injection (FDI)":
-        attack_series.loc[attack_mask] *= (1 + fdi_bias / 100)
-
-    elif attack_type == "Denial of Service (DoS)":
-        attack_series.loc[attack_mask] *= 0.2
+st.subheader("Running During-Attack Simulation")
+during_results = run_sim(wn_attack)
+during_level = during_results.node["level"].loc[:, node_id]
 
 # -------------------------------
-# SEGMENT DATA
+# POST-ATTACK SIMULATION
 # -------------------------------
-pre_attack = attack_series.loc[time_hours < t_start]
-during_attack = attack_series.loc[attack_mask]
-post_attack = attack_series.loc[time_hours > t_end]
+st.subheader("Running Post-Attack Simulation")
+post_results = run_sim(wn_base)
+post_level = post_results.node["level"].loc[:, node_id]
 
 # -------------------------------
-# PLOTS
+# PLOTTING
 # -------------------------------
-st.subheader("Results: Pre / During / Post Attack")
+st.subheader("Tank Level Response")
 
-# Plot 1: Full comparison
-fig1, ax1 = plt.subplots(figsize=(8, 4))
-baseline_series.plot(ax=ax1, label="Baseline", linewidth=2)
-attack_series.plot(ax=ax1, label="With Attack", linestyle="--")
-ax1.axvspan(t_start*3600, t_end*3600, color="red", alpha=0.2, label="Attack Window")
-ax1.set_ylabel(ylabel)
-ax1.set_xlabel("Time (seconds)")
-ax1.legend()
-ax1.grid(True)
-st.pyplot(fig1)
+col1, col2, col3 = st.columns(3)
 
-# Plot 2: Delta plot
-fig2, ax2 = plt.subplots(figsize=(8, 3))
-(attack_series - baseline_series).plot(ax=ax2, color="purple")
-ax2.axhline(0, color="black")
-ax2.set_ylabel("Deviation")
-ax2.set_title("Attack Impact (Δ)")
-ax2.grid(True)
-st.pyplot(fig2)
+with col1:
+    st.markdown("**Pre-Attack**")
+    fig, ax = plt.subplots()
+    pre_level.plot(ax=ax, color="blue")
+    ax.set_ylabel("Tank Level")
+    ax.grid(True)
+    st.pyplot(fig)
 
-# Plot 3: Segmented plot
-fig3, ax3 = plt.subplots(figsize=(8, 4))
-pre_attack.plot(ax=ax3, label="Pre-Attack")
-during_attack.plot(ax=ax3, label="During Attack")
-post_attack.plot(ax=ax3, label="Post-Attack")
-ax3.set_ylabel(ylabel)
-ax3.legend()
-ax3.grid(True)
-st.pyplot(fig3)
+with col2:
+    st.markdown("**During Attack**")
+    fig, ax = plt.subplots()
+    during_level.plot(ax=ax, color="red")
+    ax.set_ylabel("Tank Level")
+    ax.grid(True)
+    st.pyplot(fig)
+
+with col3:
+    st.markdown("**Post-Attack**")
+    fig, ax = plt.subplots()
+    post_level.plot(ax=ax, color="green")
+    ax.set_ylabel("Tank Level")
+    ax.grid(True)
+    st.pyplot(fig)
+
+# -------------------------------
+# COMPARISON PLOT
+# -------------------------------
+st.subheader("Pre vs During vs Post Comparison")
+
+fig, ax = plt.subplots(figsize=(8,4))
+pre_level.plot(ax=ax, label="Pre-Attack", linewidth=2)
+during_level.plot(ax=ax, label="During Attack", linestyle="--")
+post_level.plot(ax=ax, label="Post-Attack", linestyle=":")
+ax.set_ylabel("Tank Level")
+ax.legend()
+ax.grid(True)
+st.pyplot(fig)
 
 # -------------------------------
 # EXPORT DATA
 # -------------------------------
 st.subheader("Export Results")
 
-full_df = pd.DataFrame({
-    "baseline": baseline_series,
-    "attack": attack_series
+df = pd.DataFrame({
+    "Pre_Attack": pre_level,
+    "During_Attack": during_level,
+    "Post_Attack": post_level
 })
 
-segmented_df = pd.concat(
-    [pre_attack, during_attack, post_attack],
-    keys=["pre", "during", "post"]
-)
-
 st.download_button(
-    "Download Full Time-Series CSV",
-    full_df.to_csv().encode(),
-    "full_results.csv",
+    "Download CSV (Publication Ready)",
+    df.to_csv().encode(),
+    f"{node_id}_{attack_type.replace(' ', '_')}.csv",
     "text/csv"
 )
 
-st.download_button(
-    "Download Segmented CSV",
-    segmented_df.to_csv().encode(),
-    "segmented_results.csv",
-    "text/csv"
-)
 
 
 
