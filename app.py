@@ -1,52 +1,92 @@
 import streamlit as st
 import wntr
-from pyvis.network import Network
+import pandas as pd
+import matplotlib.pyplot as plt
 import tempfile
-import streamlit.components.v1 as components
 
 st.set_page_config(layout="wide")
-st.title("WDN CPS Security Testbed")
+st.title("WDN CPS Security Experiment Tool")
 
 uploaded_file = st.file_uploader("Upload EPANET .inp file", type=["inp"])
 
 if uploaded_file:
-    with open("network.inp", "wb") as f:
+    with open("model.inp", "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    wn = wntr.network.WaterNetworkModel("network.inp")
+    wn = wntr.network.WaterNetworkModel("model.inp")
 
-    col1, col2 = st.columns([3, 1])
+    # -------------------------------
+    # USER SELECTION
+    # -------------------------------
+    tank_id = st.selectbox("Select Tank", wn.tank_name_list)
 
-    with col1:
-        st.subheader("Water Distribution Network")
-        net = Network(height="600px", width="100%", directed=False)
-        net.barnes_hut()
+    attack_type = st.selectbox(
+        "Attack Type",
+        ["None", "False Data Injection (FDI)", "Denial of Service (DoS)"]
+    )
 
-        for name, node in wn.nodes():
-            color = "blue"
-            if node.node_type == "Tank":
-                color = "green"
-            elif node.node_type == "Reservoir":
-                color = "red"
-            net.add_node(name, label=f"{name}\n({node.node_type})", color=color)
+    attack_start = st.number_input("Attack start time (hr)", 0.0)
+    attack_end = st.number_input("Attack end time (hr)", 24.0)
 
-        for name, link in wn.links():
-            net.add_edge(link.start_node_name, link.end_node_name, label=name)
+    fdi_bias = st.slider("FDI Bias (%)", -50, 50, 20)
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-        net.save_graph(tmp.name)
-        components.html(open(tmp.name).read(), height=600)
+    # -------------------------------
+    # BASELINE SIMULATION
+    # -------------------------------
+    st.subheader("Running Baseline Simulation")
+    sim = wntr.sim.EpanetSimulator(wn)
+    baseline = sim.run_sim()
 
-    with col2:
-        st.subheader("Component Inspector")
-        comp_type = st.selectbox("Component Type", ["Node", "Link"])
+    baseline_level = baseline.node["pressure"].loc[:, tank_id]
 
-        if comp_type == "Node":
-            node_id = st.selectbox("Node ID", wn.node_name_list)
-            node = wn.get_node(node_id)
-            st.json(node.__dict__)
+    # -------------------------------
+    # ATTACK SIMULATION
+    # -------------------------------
+    wn_attack = wntr.network.WaterNetworkModel("model.inp")
 
-        else:
-            link_id = st.selectbox("Link ID", wn.link_name_list)
-            link = wn.get_link(link_id)
-            st.json(link.__dict__)
+    if attack_type == "False Data Injection (FDI)":
+        wn_attack.options.time.hydraulic_timestep = 3600
+        wn_attack.options.time.duration = 24 * 3600
+
+        # emulate FDI by altering demand
+        demand_multiplier = 1 + fdi_bias / 100
+        wn_attack.get_node(tank_id).base_demand *= demand_multiplier
+
+    elif attack_type == "Denial of Service (DoS)":
+        wn_attack.get_node(tank_id).base_demand = 0.0
+
+    sim_attack = wntr.sim.EpanetSimulator(wn_attack)
+    attack = sim_attack.run_sim()
+
+    attack_level = attack.node["pressure"].loc[:, tank_id]
+
+    # -------------------------------
+    # PLOTTING
+    # -------------------------------
+    st.subheader("Pre vs Post Attack Comparison")
+
+    fig, ax = plt.subplots()
+    baseline_level.plot(ax=ax, label="Baseline")
+    attack_level.plot(ax=ax, label="Post-Attack", linestyle="--")
+    ax.set_xlabel("Time (hours)")
+    ax.set_ylabel("Pressure")
+    ax.legend()
+    ax.grid(True)
+
+    st.pyplot(fig)
+
+    # -------------------------------
+    # EXPORT
+    # -------------------------------
+    df = pd.DataFrame({
+        "baseline": baseline_level,
+        "attack": attack_level
+    })
+
+    st.download_button(
+        "Download CSV",
+        df.to_csv().encode(),
+        "results.csv",
+        "text/csv"
+    )
+
