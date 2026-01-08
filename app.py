@@ -100,6 +100,20 @@ st.markdown("""
     .stButton button:hover {
         background-color: #1E3A8A;
     }
+    .info-box {
+        background-color: #EFF6FF;
+        border-radius: 0.5rem;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-left: 4px solid #3B82F6;
+    }
+    .warning-box {
+        background-color: #FEF3C7;
+        border-radius: 0.5rem;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-left: 4px solid #F59E0B;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -178,29 +192,29 @@ class WDNAnalyzer:
         attack_type: 'pressure' or 'flow'
         """
         if not self.results:
-            st.warning("Please run baseline simulation first")
             return None
         
         try:
-            # Create deep copies of the results dataframes
-            attack_results = wntr.sim.results.SimulationResults()
+            # Create a copy of results by running simulation again and then modifying
+            # First, let's create a simple attack by modifying the results directly
+            attack_results = type(self.results)()
             
-            # Copy node results
+            # Copy node results with manual copy of dataframes
             if hasattr(self.results.node, 'pressure'):
-                attack_results.node['pressure'] = self.results.node['pressure'].copy()
+                attack_results.node['pressure'] = self.results.node['pressure'].copy(deep=True)
             
             if hasattr(self.results.node, 'demand'):
-                attack_results.node['demand'] = self.results.node['demand'].copy()
+                attack_results.node['demand'] = self.results.node['demand'].copy(deep=True)
             
             if hasattr(self.results.node, 'head'):
-                attack_results.node['head'] = self.results.node['head'].copy()
+                attack_results.node['head'] = self.results.node['head'].copy(deep=True)
             
             # Copy link results
             if hasattr(self.results.link, 'flowrate'):
-                attack_results.link['flowrate'] = self.results.link['flowrate'].copy()
+                attack_results.link['flowrate'] = self.results.link['flowrate'].copy(deep=True)
             
             if hasattr(self.results.link, 'velocity'):
-                attack_results.link['velocity'] = self.results.link['velocity'].copy()
+                attack_results.link['velocity'] = self.results.link['velocity'].copy(deep=True)
             
             if target_nodes is None:
                 # Default to attacking 20% of nodes
@@ -246,6 +260,8 @@ class WDNAnalyzer:
             
         except Exception as e:
             st.error(f"FDI attack simulation error: {str(e)}")
+            import traceback
+            st.error(traceback.format_exc())
             return None
     
     def simulate_dos_attack(self, target_links=None, attack_duration=2):
@@ -261,11 +277,15 @@ class WDNAnalyzer:
             return None, []
         
         try:
-            # Create a new network model by writing and reading from a temp file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.inp', delete=False) as tmp_file:
-                self.wn.write_inpfile(tmp_file.name)
-                wn_dos = WaterNetworkModel(tmp_file.name)
-                os.unlink(tmp_file.name)
+            # Create a new temporary file for the modified network
+            temp_dir = tempfile.gettempdir()
+            temp_inp = os.path.join(temp_dir, f"dos_attack_{datetime.now().strftime('%Y%m%d_%H%M%S')}.inp")
+            
+            # Write the current network to a file
+            self.wn.write_inpfile(temp_inp)
+            
+            # Load it back to create a copy
+            wn_dos = WaterNetworkModel(temp_inp)
             
             if target_links is None:
                 # Default to attacking 10% of pipes
@@ -278,24 +298,23 @@ class WDNAnalyzer:
             for link_id in target_links:
                 if link_id in wn_dos.link_name_list:
                     link = wn_dos.get_link(link_id)
-                    if link.link_type == 'Pipe':
-                        link.status = 0  # Closed
-                        attacked_links.append(link_id)
-                    elif link.link_type == 'Pump':
-                        link.status = 0  # Closed
-                        attacked_links.append(link_id)
-                    elif link.link_type == 'Valve':
-                        link.status = 0  # Closed
-                        attacked_links.append(link_id)
+                    link.status = 0  # Closed
+                    attacked_links.append(link_id)
             
             # Run simulation with DOS attack
             sim = wntr.sim.EpanetSimulator(wn_dos)
             dos_results = sim.run_sim()
             
+            # Clean up temp file
+            if os.path.exists(temp_inp):
+                os.remove(temp_inp)
+            
             return dos_results, attacked_links
             
         except Exception as e:
             st.error(f"DoS attack simulation error: {str(e)}")
+            import traceback
+            st.error(traceback.format_exc())
             return None, []
     
     def create_network_plot(self, plot_type="Basic Network"):
@@ -335,13 +354,14 @@ class WDNAnalyzer:
                 node_shapes = []
                 for node in G.nodes():
                     node_obj = self.wn.get_node(node)
-                    if node_obj.node_type == 'Junction':
+                    node_type = getattr(node_obj, 'node_type', 'Junction')
+                    if 'JUNCTION' in str(node_type).upper():
                         node_colors.append('blue')
                         node_shapes.append('o')
-                    elif node_obj.node_type == 'Reservoir':
+                    elif 'RESERVOIR' in str(node_type).upper():
                         node_colors.append('green')
                         node_shapes.append('s')
-                    elif node_obj.node_type == 'Tank':
+                    elif 'TANK' in str(node_type).upper():
                         node_colors.append('orange')
                         node_shapes.append('^')
                     else:
@@ -472,13 +492,6 @@ class WDNAnalyzer:
         ax.spines['right'].set_visible(False)
         
         return fig
-    
-    def export_to_csv(self, dataframe, filename):
-        """Export DataFrame to CSV with download link"""
-        csv = dataframe.to_csv(index=True)
-        b64 = base64.b64encode(csv.encode()).decode()
-        href = f'<a href="data:file/csv;base64,{b64}" download="{filename}.csv">Download {filename} CSV</a>'
-        return href
 
 def main():
     """Main application function"""
@@ -492,7 +505,7 @@ def main():
     if not WNTR_AVAILABLE:
         st.stop()
     
-    # Initialize analyzer
+    # Initialize analyzer in session state
     if 'analyzer' not in st.session_state:
         st.session_state.analyzer = WDNAnalyzer()
     
@@ -510,11 +523,20 @@ def main():
         )
         
         st.markdown("---")
-        st.markdown("### Settings")
+        st.markdown("### Status")
         
         if analyzer.wn:
             network_name = getattr(analyzer.wn, 'name', 'Unknown Network')
-            st.info(f"Network Loaded: {network_name}")
+            st.success(f"✓ Network Loaded: {network_name}")
+        
+        if analyzer.results:
+            st.success("✓ Baseline Simulation Complete")
+        
+        if hasattr(st.session_state, 'fdi_results'):
+            st.info("✓ FDI Attack Simulated")
+        
+        if hasattr(st.session_state, 'dos_results'):
+            st.info("✓ DoS Attack Simulated")
         
         st.markdown("---")
         st.markdown("""
@@ -588,43 +610,68 @@ def render_upload_overview(analyzer):
                                         </div>
                                         """, unsafe_allow_html=True)
                         
-                        # Run baseline simulation
+                        # Add a separator
+                        st.markdown("---")
+                        
+                        # Run baseline simulation section
+                        st.markdown('<h3 class="sub-header">Baseline Simulation</h3>', unsafe_allow_html=True)
+                        
                         if st.button("🚀 Run Baseline Simulation", type="primary", use_container_width=True):
                             with st.spinner("Running hydraulic simulation..."):
                                 results = analyzer.simulate_hydraulics()
                                 if results is not None:
                                     st.success("Baseline simulation completed successfully!")
+                                    
+                                    # Store baseline completion in session state
                                     st.session_state.baseline_completed = True
+                                    st.session_state.baseline_results = True
                                     
                                     # Show quick results
                                     if hasattr(results.node, 'pressure'):
                                         avg_pressure = results.node['pressure'].mean().mean()
                                         st.metric("Average Network Pressure", f"{avg_pressure:.2f} m")
+                                        
+                                        # Also show min and max
+                                        min_pressure = results.node['pressure'].min().min()
+                                        max_pressure = results.node['pressure'].max().max()
+                                        
+                                        col1, col2, col3 = st.columns(3)
+                                        with col1:
+                                            st.metric("Min Pressure", f"{min_pressure:.2f} m")
+                                        with col2:
+                                            st.metric("Avg Pressure", f"{avg_pressure:.2f} m")
+                                        with col3:
+                                            st.metric("Max Pressure", f"{max_pressure:.2f} m")
+                                    
+                                    st.info("✅ Baseline simulation complete. You can now proceed to Attack Simulation.")
                     
                     else:
                         st.error(message)
     
     with col2:
-        st.markdown("### Sample Networks")
+        st.markdown("### Quick Start Guide")
         st.markdown("""
-        Try these standard EPANET examples:
+        **Step-by-Step:**
         
-        1. **Net3.inp** 
-        2. **BWSN_Network_1.inp**
-        3. **Anytown.inp**
-        
-        *Available from EPANET examples*
+        1. **Upload** your .inp file
+        2. **Load** the network
+        3. **Run** baseline simulation
+        4. **Visualize** the network
+        5. **Simulate** attacks
+        6. **Analyze** results
+        7. **Export** for publication
         """)
         
-        st.markdown("### Quick Start")
-        st.markdown("""
-        1. Upload .inp file
-        2. Load network
-        3. Run baseline simulation
-        4. Visualize network
-        5. Simulate attacks
-        6. Export results
-        """)
+        st.markdown("### Status Check")
+        if analyzer.wn:
+            st.success("✓ Network loaded")
+        else:
+            st.warning("✗ Network not loaded")
+        
+        if analyzer.results:
+            st.success("✓ Baseline simulation complete")
+        else:
+            st.warning("✗ Baseline not run")
 
 def render_visualization(analyzer):
     """Render network visualization section"""
@@ -697,10 +744,23 @@ def render_attack_simulation(analyzer):
     
     if not analyzer.wn:
         st.warning("Please upload and load an EPANET .inp file first")
+        st.info("Go to '📁 Upload & Overview' to load your network model")
         return
     
-    if 'baseline_completed' not in st.session_state:
-        st.warning("Please run baseline simulation first in '📁 Upload & Overview'")
+    # Check if baseline simulation has been run
+    if not analyzer.results:
+        st.markdown('<div class="warning-box">', unsafe_allow_html=True)
+        st.warning("⚠️ **Baseline Simulation Required**")
+        st.markdown("""
+        Please run the baseline simulation first:
+        
+        1. Go to **'📁 Upload & Overview'**
+        2. Upload your .inp file
+        3. Click **'Load Network'**
+        4. Click **'🚀 Run Baseline Simulation'**
+        5. Return here after successful simulation
+        """)
+        st.markdown('</div>', unsafe_allow_html=True)
         return
     
     tab1, tab2 = st.tabs(["🔓 False Data Injection (FDI)", "🚫 Denial of Service (DoS)"])
@@ -788,7 +848,7 @@ def render_attack_simulation(analyzer):
                         'targets': target_nodes,
                         'strategy': attack_strategy
                     }
-                    st.success("FDI attack simulation completed!")
+                    st.success("✅ FDI attack simulation completed!")
                     
                     # Show impact metrics
                     if analyzer.results and hasattr(st.session_state, 'fdi_results'):
@@ -909,7 +969,7 @@ def render_attack_simulation(analyzer):
                         'recovery': recovery_time,
                         'strategy': dos_strategy
                     }
-                    st.success(f"DoS attack simulation completed! {len(attacked_links)} components disabled.")
+                    st.success(f"✅ DoS attack simulation completed! {len(attacked_links)} components disabled.")
                     
                     # Show impact
                     if analyzer.results:
@@ -953,7 +1013,10 @@ def render_results_analysis(analyzer):
     st.markdown('<h2 class="sub-header">📈 Results Analysis</h2>', unsafe_allow_html=True)
     
     if not analyzer.results:
-        st.warning("Please run baseline simulation first")
+        st.markdown('<div class="warning-box">', unsafe_allow_html=True)
+        st.warning("No simulation results available")
+        st.markdown("Please run baseline simulation first in '📁 Upload & Overview'")
+        st.markdown('</div>', unsafe_allow_html=True)
         return
     
     tab1, tab2, tab3 = st.tabs(["📊 Baseline Results", "⚡ Attack Comparison", "📉 Impact Metrics"])
@@ -1135,7 +1198,7 @@ def render_export_results(analyzer):
     st.markdown('<h2 class="sub-header">💾 Export Results</h2>', unsafe_allow_html=True)
     
     if not analyzer.results:
-        st.warning("No simulation results to export")
+        st.warning("No simulation results to export. Please run baseline simulation first.")
         return
     
     col1, col2 = st.columns(2)
@@ -1249,7 +1312,10 @@ def render_export_results(analyzer):
                     
                     st.markdown(download_link, unsafe_allow_html=True)
             
-            st.success("Export files ready for download!")
+            if export_items:
+                st.success("✅ Export files ready for download!")
+            else:
+                st.warning("No data selected for export")
 
 if __name__ == "__main__":
     main()
