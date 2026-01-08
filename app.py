@@ -122,10 +122,12 @@ class WDNAnalyzer:
     
     def __init__(self):
         self.wn = None
-        self.results = None
+        self.baseline_results = None
         self.attack_results = None
         self.network_graph = None
         self.temp_file_path = None
+        self.fdi_params = {}
+        self.dos_params = {}
         
     def load_inp_file(self, uploaded_file):
         """Load EPANET .inp file from uploaded file"""
@@ -168,17 +170,17 @@ class WDNAnalyzer:
         }
         return props
     
-    def simulate_hydraulics(self):
-        """Run hydraulic simulation"""
+    def simulate_baseline(self):
+        """Run baseline hydraulic simulation"""
         if not self.wn:
             return None
         
         try:
             sim = wntr.sim.EpanetSimulator(self.wn)
-            self.results = sim.run_sim()
-            return self.results
+            self.baseline_results = sim.run_sim()
+            return self.baseline_results
         except Exception as e:
-            st.error(f"Simulation error: {str(e)}")
+            st.error(f"Baseline simulation error: {str(e)}")
             return None
     
     def simulate_fdi_attack(self, target_nodes=None, attack_magnitude=0.3, attack_type='pressure'):
@@ -191,77 +193,73 @@ class WDNAnalyzer:
         attack_magnitude: magnitude of false data injection (0-1)
         attack_type: 'pressure' or 'flow'
         """
-        if not self.results:
+        if not self.wn:
             return None
         
         try:
-            # Create a copy of results by running simulation again and then modifying
-            # First, let's create a simple attack by modifying the results directly
-            attack_results = type(self.results)()
+            # Run a fresh simulation for the attack scenario
+            sim = wntr.sim.EpanetSimulator(self.wn)
+            normal_results = sim.run_sim()
             
-            # Copy node results with manual copy of dataframes
-            if hasattr(self.results.node, 'pressure'):
-                attack_results.node['pressure'] = self.results.node['pressure'].copy(deep=True)
+            # Create attacked results by modifying the simulation results
+            attack_results = type(normal_results)()
             
-            if hasattr(self.results.node, 'demand'):
-                attack_results.node['demand'] = self.results.node['demand'].copy(deep=True)
+            # Copy all results
+            if hasattr(normal_results.node, 'pressure'):
+                attack_results.node['pressure'] = normal_results.node['pressure'].copy(deep=True)
             
-            if hasattr(self.results.node, 'head'):
-                attack_results.node['head'] = self.results.node['head'].copy(deep=True)
+            if hasattr(normal_results.node, 'demand'):
+                attack_results.node['demand'] = normal_results.node['demand'].copy(deep=True)
             
-            # Copy link results
-            if hasattr(self.results.link, 'flowrate'):
-                attack_results.link['flowrate'] = self.results.link['flowrate'].copy(deep=True)
+            if hasattr(normal_results.node, 'head'):
+                attack_results.node['head'] = normal_results.node['head'].copy(deep=True)
             
-            if hasattr(self.results.link, 'velocity'):
-                attack_results.link['velocity'] = self.results.link['velocity'].copy(deep=True)
+            if hasattr(normal_results.link, 'flowrate'):
+                attack_results.link['flowrate'] = normal_results.link['flowrate'].copy(deep=True)
             
-            if target_nodes is None:
+            if hasattr(normal_results.link, 'velocity'):
+                attack_results.link['velocity'] = normal_results.link['velocity'].copy(deep=True)
+            
+            if target_nodes is None or len(target_nodes) == 0:
                 # Default to attacking 20% of nodes
                 all_nodes = list(self.wn.node_name_list)
                 n_attack = max(1, int(len(all_nodes) * 0.2))
-                target_nodes = np.random.choice(all_nodes, n_attack, replace=False)
+                target_nodes = np.random.choice(all_nodes, n_attack, replace=False).tolist()
             
+            # Apply FDI attack
             if attack_type == 'pressure':
                 for node in target_nodes:
                     if node in attack_results.node['pressure'].columns:
-                        # Get the baseline pressure data
-                        baseline_pressure = self.results.node['pressure'][node]
-                        
-                        # Calculate attack magnitude relative to baseline
-                        std_dev = baseline_pressure.std()
-                        if std_dev == 0:
-                            std_dev = 1.0
-                        
-                        # Add bias attack (scaled by attack_magnitude)
-                        bias = attack_magnitude * std_dev * np.random.randn()
-                        
-                        # Add noise attack
-                        noise_level = 0.1 * attack_magnitude * std_dev
-                        noise = noise_level * np.random.randn(len(attack_results.node['pressure']))
-                        
-                        # Apply attack
-                        attack_results.node['pressure'][node] = baseline_pressure + bias + noise
+                        baseline_data = normal_results.node['pressure'][node]
+                        # Add random bias and noise
+                        bias = attack_magnitude * 10 * np.random.randn()  # Scale for realistic pressure changes
+                        noise = attack_magnitude * 5 * np.random.randn(len(baseline_data))
+                        attack_results.node['pressure'][node] = baseline_data + bias + noise
             
             elif attack_type == 'flow':
-                for node in target_nodes:
-                    # For flow attacks, we need to check if node is a link
-                    if node in self.wn.link_name_list and node in attack_results.link['flowrate'].columns:
-                        baseline_flow = self.results.link['flowrate'][node]
-                        std_dev = baseline_flow.std()
-                        if std_dev == 0:
-                            std_dev = 1.0
-                        
-                        bias = attack_magnitude * std_dev * np.random.randn()
-                        attack_results.link['flowrate'][node] = baseline_flow + bias
+                # For flow attacks, target links instead
+                all_links = list(self.wn.link_name_list)
+                n_attack = max(1, int(len(all_links) * 0.2))
+                target_links = np.random.choice(all_links, n_attack, replace=False)
+                
+                for link in target_links:
+                    if link in attack_results.link['flowrate'].columns:
+                        baseline_data = normal_results.link['flowrate'][link]
+                        bias = attack_magnitude * 0.1 * np.random.randn()  # Scale for flow
+                        attack_results.link['flowrate'][link] = baseline_data + bias
             
-            self.attack_results = attack_results
+            # Store attack parameters
+            self.fdi_params = {
+                'target_nodes': target_nodes,
+                'attack_magnitude': attack_magnitude,
+                'attack_type': attack_type,
+                'normal_results': normal_results
+            }
+            
             return attack_results
             
         except Exception as e:
             st.error(f"FDI attack simulation error: {str(e)}")
-            import traceback
-            st.error(traceback.format_exc())
             return None
     
     def simulate_dos_attack(self, target_links=None, attack_duration=2):
@@ -287,11 +285,11 @@ class WDNAnalyzer:
             # Load it back to create a copy
             wn_dos = WaterNetworkModel(temp_inp)
             
-            if target_links is None:
+            if target_links is None or len(target_links) == 0:
                 # Default to attacking 10% of pipes
                 pipes = [link for link in wn_dos.link_name_list if wn_dos.get_link(link).link_type == 'Pipe']
                 n_attack = max(1, int(len(pipes) * 0.1))
-                target_links = np.random.choice(pipes, n_attack, replace=False)
+                target_links = np.random.choice(pipes, n_attack, replace=False).tolist()
             
             # Close the target links by setting status to 0 (closed)
             attacked_links = []
@@ -309,12 +307,17 @@ class WDNAnalyzer:
             if os.path.exists(temp_inp):
                 os.remove(temp_inp)
             
+            # Store attack parameters
+            self.dos_params = {
+                'target_links': target_links,
+                'attack_duration': attack_duration,
+                'attacked_links': attacked_links
+            }
+            
             return dos_results, attacked_links
             
         except Exception as e:
             st.error(f"DoS attack simulation error: {str(e)}")
-            import traceback
-            st.error(traceback.format_exc())
             return None, []
     
     def create_network_plot(self, plot_type="Basic Network"):
@@ -354,14 +357,14 @@ class WDNAnalyzer:
                 node_shapes = []
                 for node in G.nodes():
                     node_obj = self.wn.get_node(node)
-                    node_type = getattr(node_obj, 'node_type', 'Junction')
-                    if 'JUNCTION' in str(node_type).upper():
+                    node_type = str(type(node_obj)).lower()
+                    if 'junction' in node_type:
                         node_colors.append('blue')
                         node_shapes.append('o')
-                    elif 'RESERVOIR' in str(node_type).upper():
+                    elif 'reservoir' in node_type:
                         node_colors.append('green')
                         node_shapes.append('s')
-                    elif 'TANK' in str(node_type).upper():
+                    elif 'tank' in node_type:
                         node_colors.append('orange')
                         node_shapes.append('^')
                     else:
@@ -395,62 +398,30 @@ class WDNAnalyzer:
                 ]
                 ax.legend(handles=legend_elements, loc='upper right')
             
-            elif plot_type == "Pressure Distribution" and self.results is not None:
-                if hasattr(self.results.node, 'pressure'):
-                    # Get pressure at last time step
-                    pressure = self.results.node['pressure'].iloc[-1]
+            elif plot_type == "Attack Impact" and hasattr(self, 'fdi_params') and 'normal_results' in self.fdi_params:
+                # Compare normal vs attacked results
+                if hasattr(self.fdi_params['normal_results'].node, 'pressure'):
+                    normal_pressure = self.fdi_params['normal_results'].node['pressure']
+                    attack_pressure = st.session_state.fdi_results.node['pressure'] if 'fdi_results' in st.session_state else None
                     
-                    # Get coordinates
-                    pos = {}
-                    has_coordinates = True
-                    
-                    for node_name in self.wn.node_name_list:
-                        node = self.wn.get_node(node_name)
-                        if hasattr(node, 'coordinates') and node.coordinates is not None:
-                            if len(node.coordinates) >= 2:
-                                pos[node_name] = (node.coordinates[0], node.coordinates[1])
-                            else:
-                                has_coordinates = False
-                                break
-                        else:
-                            has_coordinates = False
-                            break
-                    
-                    if not has_coordinates or not pos:
-                        G = self.wn.get_graph()
-                        pos = nx.spring_layout(G, seed=42)
-                    else:
-                        G = self.wn.get_graph()
-                    
-                    # Map pressure to colors
-                    node_values = []
-                    for node in G.nodes():
-                        if node in pressure.index:
-                            node_values.append(pressure[node])
-                        else:
-                            node_values.append(0)
-                    
-                    # Normalize for colormap
-                    if node_values:
-                        vmin = min(node_values)
-                        vmax = max(node_values)
-                        if vmin == vmax:
-                            vmin = vmin - 1
-                            vmax = vmax + 1
-                    else:
-                        vmin = 0
-                        vmax = 1
-                    
-                    nodes = nx.draw_networkx_nodes(G, pos, node_color=node_values, 
-                                                  node_size=100, cmap=plt.cm.viridis,
-                                                  vmin=vmin, vmax=vmax, ax=ax)
-                    nx.draw_networkx_edges(G, pos, width=1, alpha=0.5, ax=ax)
-                    
-                    # Add colorbar
-                    cbar = plt.colorbar(nodes, ax=ax)
-                    cbar.set_label('Pressure (m)', fontweight='bold')
-                    ax.set_title("Pressure Distribution at Final Time Step", fontweight='bold')
-                    ax.axis('off')
+                    if attack_pressure is not None:
+                        # Get first node for comparison
+                        node_to_compare = list(normal_pressure.columns)[0] if len(normal_pressure.columns) > 0 else None
+                        
+                        if node_to_compare:
+                            fig, ax = plt.subplots(figsize=(10, 6))
+                            
+                            # Plot normal and attacked pressures
+                            ax.plot(normal_pressure.index / 3600, normal_pressure[node_to_compare], 
+                                   label='Normal Operation', linewidth=2, color='#1E40AF')
+                            ax.plot(attack_pressure.index / 3600, attack_pressure[node_to_compare], 
+                                   label='Under FDI Attack', linewidth=2, color='#DC2626', linestyle='--')
+                            
+                            ax.set_xlabel("Time (hours)", fontweight='bold')
+                            ax.set_ylabel("Pressure (m)", fontweight='bold')
+                            ax.set_title(f"FDI Attack Impact at Node {node_to_compare}", fontweight='bold')
+                            ax.legend()
+                            ax.grid(True, alpha=0.3, linestyle='--')
             
             return fig
             
@@ -529,9 +500,6 @@ def main():
             network_name = getattr(analyzer.wn, 'name', 'Unknown Network')
             st.success(f"✓ Network Loaded: {network_name}")
         
-        if analyzer.results:
-            st.success("✓ Baseline Simulation Complete")
-        
         if hasattr(st.session_state, 'fdi_results'):
             st.info("✓ FDI Attack Simulated")
         
@@ -575,11 +543,6 @@ def render_upload_overview(analyzer):
             file_details = {"Filename": uploaded_file.name, "FileSize": f"{uploaded_file.size / 1024:.1f} KB"}
             st.write(file_details)
             
-            # Preview first few lines
-            if st.checkbox("Preview file content"):
-                content = uploaded_file.getvalue().decode("utf-8")
-                st.text_area("File Preview", content[:2000], height=200)
-            
             # Load network
             if st.button("📥 Load Network", type="primary", use_container_width=True):
                 with st.spinner("Loading network..."):
@@ -609,41 +572,6 @@ def render_upload_overview(analyzer):
                                             <div style="font-size: 1.5rem; font-weight: 700; color: #1E40AF;">{value}</div>
                                         </div>
                                         """, unsafe_allow_html=True)
-                        
-                        # Add a separator
-                        st.markdown("---")
-                        
-                        # Run baseline simulation section
-                        st.markdown('<h3 class="sub-header">Baseline Simulation</h3>', unsafe_allow_html=True)
-                        
-                        if st.button("🚀 Run Baseline Simulation", type="primary", use_container_width=True):
-                            with st.spinner("Running hydraulic simulation..."):
-                                results = analyzer.simulate_hydraulics()
-                                if results is not None:
-                                    st.success("Baseline simulation completed successfully!")
-                                    
-                                    # Store baseline completion in session state
-                                    st.session_state.baseline_completed = True
-                                    st.session_state.baseline_results = True
-                                    
-                                    # Show quick results
-                                    if hasattr(results.node, 'pressure'):
-                                        avg_pressure = results.node['pressure'].mean().mean()
-                                        st.metric("Average Network Pressure", f"{avg_pressure:.2f} m")
-                                        
-                                        # Also show min and max
-                                        min_pressure = results.node['pressure'].min().min()
-                                        max_pressure = results.node['pressure'].max().max()
-                                        
-                                        col1, col2, col3 = st.columns(3)
-                                        with col1:
-                                            st.metric("Min Pressure", f"{min_pressure:.2f} m")
-                                        with col2:
-                                            st.metric("Avg Pressure", f"{avg_pressure:.2f} m")
-                                        with col3:
-                                            st.metric("Max Pressure", f"{max_pressure:.2f} m")
-                                    
-                                    st.info("✅ Baseline simulation complete. You can now proceed to Attack Simulation.")
                     
                     else:
                         st.error(message)
@@ -655,11 +583,10 @@ def render_upload_overview(analyzer):
         
         1. **Upload** your .inp file
         2. **Load** the network
-        3. **Run** baseline simulation
-        4. **Visualize** the network
-        5. **Simulate** attacks
-        6. **Analyze** results
-        7. **Export** for publication
+        3. **Visualize** the network
+        4. **Simulate** attacks
+        5. **Analyze** results
+        6. **Export** for publication
         """)
         
         st.markdown("### Status Check")
@@ -667,11 +594,6 @@ def render_upload_overview(analyzer):
             st.success("✓ Network loaded")
         else:
             st.warning("✗ Network not loaded")
-        
-        if analyzer.results:
-            st.success("✓ Baseline simulation complete")
-        else:
-            st.warning("✗ Baseline not run")
 
 def render_visualization(analyzer):
     """Render network visualization section"""
@@ -690,7 +612,7 @@ def render_visualization(analyzer):
         
         plot_type = st.selectbox(
             "Select visualization type:",
-            ["Basic Network", "Pressure Distribution"]
+            ["Basic Network", "Attack Impact"]
         )
         
         # Create and display plot
@@ -747,22 +669,6 @@ def render_attack_simulation(analyzer):
         st.info("Go to '📁 Upload & Overview' to load your network model")
         return
     
-    # Check if baseline simulation has been run
-    if not analyzer.results:
-        st.markdown('<div class="warning-box">', unsafe_allow_html=True)
-        st.warning("⚠️ **Baseline Simulation Required**")
-        st.markdown("""
-        Please run the baseline simulation first:
-        
-        1. Go to **'📁 Upload & Overview'**
-        2. Upload your .inp file
-        3. Click **'Load Network'**
-        4. Click **'🚀 Run Baseline Simulation'**
-        5. Return here after successful simulation
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-        return
-    
     tab1, tab2 = st.tabs(["🔓 False Data Injection (FDI)", "🚫 Denial of Service (DoS)"])
     
     with tab1:
@@ -787,8 +693,8 @@ def render_attack_simulation(analyzer):
             
             attack_magnitude = st.slider(
                 "Attack magnitude:",
-                0.0, 1.0, 0.3, 0.05,
-                help="Magnitude of false data injection (0-1 scale)",
+                0.0, 2.0, 0.5, 0.1,
+                help="Magnitude of false data injection",
                 key="fdi_magnitude"
             )
             
@@ -807,7 +713,7 @@ def render_attack_simulation(analyzer):
                 
                 attack_strategy = st.radio(
                     "Attack strategy:",
-                    ["Random nodes", "Specific nodes"],
+                    ["Random nodes", "Specific nodes", "Critical nodes"],
                     key="fdi_strategy"
                 )
                 
@@ -817,9 +723,13 @@ def render_attack_simulation(analyzer):
                         nodes,
                         key="fdi_target_nodes"
                     )
+                elif attack_strategy == "Critical nodes":
+                    # Select nodes with high demand (if available)
+                    target_nodes = nodes[:min(5, len(nodes))]  # First 5 nodes as example
+                    st.info(f"Will attack {len(target_nodes)} critical nodes")
                 else:
-                    n_attack = st.slider("Number of nodes to attack:", 
-                                        1, min(10, len(nodes)), 3,
+                    n_attack = st.slider("Number of random nodes to attack:", 
+                                        1, min(15, len(nodes)), 5,
                                         key="fdi_n_nodes")
                     target_nodes = None
         
@@ -827,7 +737,7 @@ def render_attack_simulation(analyzer):
         if st.button("🚨 Simulate FDI Attack", type="primary", use_container_width=True, key="fdi_button"):
             with st.spinner("Simulating FDI attack..."):
                 # Prepare target nodes if not specified
-                if target_nodes is None and analyzer.wn:
+                if target_nodes is None and analyzer.wn and attack_strategy == "Random nodes":
                     nodes = list(analyzer.wn.node_name_list)
                     target_nodes = list(np.random.choice(nodes, n_attack, replace=False))
                 
@@ -851,12 +761,13 @@ def render_attack_simulation(analyzer):
                     st.success("✅ FDI attack simulation completed!")
                     
                     # Show impact metrics
-                    if analyzer.results and hasattr(st.session_state, 'fdi_results'):
-                        if hasattr(analyzer.results.node, 'pressure') and hasattr(st.session_state.fdi_results.node, 'pressure'):
-                            baseline_pressure = analyzer.results.node['pressure'].mean().mean()
-                            attack_pressure = st.session_state.fdi_results.node['pressure'].mean().mean()
-                            pressure_change = attack_pressure - baseline_pressure
-                            impact_percent = abs((pressure_change) / baseline_pressure * 100) if baseline_pressure != 0 else 0
+                    if hasattr(analyzer, 'fdi_params') and 'normal_results' in analyzer.fdi_params:
+                        normal_results = analyzer.fdi_params['normal_results']
+                        if hasattr(normal_results.node, 'pressure') and hasattr(attack_results.node, 'pressure'):
+                            normal_pressure = normal_results.node['pressure'].mean().mean()
+                            attack_pressure = attack_results.node['pressure'].mean().mean()
+                            pressure_change = attack_pressure - normal_pressure
+                            impact_percent = abs((pressure_change) / normal_pressure * 100) if normal_pressure != 0 else 0
                             
                             col1, col2, col3 = st.columns(3)
                             with col1:
@@ -897,7 +808,7 @@ def render_attack_simulation(analyzer):
             
             attack_severity = st.slider(
                 "Attack severity (% of components):",
-                1, 50, 10,
+                1, 50, 15,
                 help="Percentage of components to disable",
                 key="dos_severity"
             )
@@ -927,7 +838,7 @@ def render_attack_simulation(analyzer):
                 
                 dos_strategy = st.radio(
                     "Attack strategy:",
-                    ["Random components", "Specific components"],
+                    ["Random components", "Specific components", "Critical components"],
                     key="dos_strategy"
                 )
                 
@@ -937,16 +848,23 @@ def render_attack_simulation(analyzer):
                         available_components,
                         key="dos_target_components"
                     )
+                elif dos_strategy == "Critical components":
+                    # Select long pipes or high capacity components
+                    target_components = available_components[:min(3, len(available_components))]
+                    st.info(f"Will attack {len(target_components)} critical {dos_type.lower()}")
                 else:
-                    n_attack = max(1, int(len(available_components) * attack_severity / 100))
-                    st.info(f"Will randomly disable {n_attack} {dos_type.lower()}")
+                    if len(available_components) > 0:
+                        n_attack = max(1, int(len(available_components) * attack_severity / 100))
+                        st.info(f"Will randomly disable {n_attack} {dos_type.lower()} ({attack_severity}%)")
+                    else:
+                        st.warning(f"No {dos_type.lower()} available in the network")
                     target_components = None
         
         # Run DoS attack
         if st.button("🚨 Simulate DoS Attack", type="primary", use_container_width=True, key="dos_button"):
             with st.spinner("Simulating DoS attack..."):
                 # Prepare target components if not specified
-                if target_components is None and analyzer.wn:
+                if target_components is None and analyzer.wn and dos_strategy == "Random components":
                     if len(available_components) > 0:
                         n_attack = max(1, int(len(available_components) * attack_severity / 100))
                         target_components = list(np.random.choice(available_components, 
@@ -962,7 +880,6 @@ def render_attack_simulation(analyzer):
                 
                 if dos_results is not None:
                     st.session_state.dos_results = dos_results
-                    st.session_state.dos_attacked_links = attacked_links
                     st.session_state.dos_params = {
                         'type': dos_type,
                         'severity': attack_severity,
@@ -972,85 +889,79 @@ def render_attack_simulation(analyzer):
                     st.success(f"✅ DoS attack simulation completed! {len(attacked_links)} components disabled.")
                     
                     # Show impact
-                    if analyzer.results:
-                        if hasattr(analyzer.results.link, 'flowrate') and hasattr(dos_results.link, 'flowrate'):
-                            baseline_flow = analyzer.results.link['flowrate'].abs().mean().mean()
-                            dos_flow = dos_results.link['flowrate'].abs().mean().mean()
-                            if baseline_flow != 0:
-                                flow_reduction = ((baseline_flow - dos_flow) / baseline_flow * 100)
-                            else:
-                                flow_reduction = 0
-                            
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric(
-                                    label="Flow Reduction",
-                                    value=f"{flow_reduction:.1f}%",
-                                    delta="Negative impact" if flow_reduction > 0 else "No change"
-                                )
-                            with col2:
-                                st.metric(
-                                    label="Components Disabled",
-                                    value=len(attacked_links)
-                                )
-                            with col3:
-                                # Estimate affected nodes
-                                affected_nodes = set()
-                                for link in attacked_links:
-                                    try:
-                                        link_obj = analyzer.wn.get_link(link)
-                                        affected_nodes.add(link_obj.start_node_name)
-                                        affected_nodes.add(link_obj.end_node_name)
-                                    except:
-                                        pass
-                                st.metric(
-                                    label="Nodes Affected",
-                                    value=len(affected_nodes)
-                                )
+                    if hasattr(dos_results.link, 'flowrate'):
+                        dos_flow = dos_results.link['flowrate'].abs().mean().mean()
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric(
+                                label="Avg Flow Rate",
+                                value=f"{dos_flow:.4f} m³/s"
+                            )
+                        with col2:
+                            st.metric(
+                                label="Components Disabled",
+                                value=len(attacked_links)
+                            )
+                        with col3:
+                            # Estimate affected nodes
+                            affected_nodes = set()
+                            for link in attacked_links:
+                                try:
+                                    link_obj = analyzer.wn.get_link(link)
+                                    affected_nodes.add(link_obj.start_node_name)
+                                    affected_nodes.add(link_obj.end_node_name)
+                                except:
+                                    pass
+                            st.metric(
+                                label="Nodes Affected",
+                                value=len(affected_nodes)
+                            )
 
 def render_results_analysis(analyzer):
     """Render results analysis section"""
     st.markdown('<h2 class="sub-header">📈 Results Analysis</h2>', unsafe_allow_html=True)
     
-    if not analyzer.results:
-        st.markdown('<div class="warning-box">', unsafe_allow_html=True)
-        st.warning("No simulation results available")
-        st.markdown("Please run baseline simulation first in '📁 Upload & Overview'")
-        st.markdown('</div>', unsafe_allow_html=True)
+    # Check what results are available
+    has_fdi = hasattr(st.session_state, 'fdi_results')
+    has_dos = hasattr(st.session_state, 'dos_results')
+    
+    if not (has_fdi or has_dos):
+        st.info("No attack simulation results available. Please run attack simulations first.")
         return
     
-    tab1, tab2, tab3 = st.tabs(["📊 Baseline Results", "⚡ Attack Comparison", "📉 Impact Metrics"])
+    tab1, tab2, tab3 = st.tabs(["📊 Attack Results", "⚡ Impact Visualization", "📉 Attack Metrics"])
     
     with tab1:
-        st.markdown("### Baseline Simulation Results")
+        st.markdown("### Attack Simulation Results")
         
-        # Select results to display
-        result_type = st.selectbox(
-            "Select result type:",
-            ["Node Pressure", "Link Flow", "Node Demand"],
-            key="baseline_result_type"
-        )
+        # Select which attack results to display
+        if has_fdi and has_dos:
+            result_type = st.selectbox(
+                "Select attack type to display:",
+                ["FDI Attack", "DoS Attack"],
+                key="attack_result_type"
+            )
+        elif has_fdi:
+            result_type = "FDI Attack"
+        else:
+            result_type = "DoS Attack"
         
-        if result_type == "Node Pressure":
-            if hasattr(analyzer.results.node, 'pressure'):
-                data = analyzer.results.node['pressure']
+        if result_type == "FDI Attack" and has_fdi:
+            if hasattr(st.session_state.fdi_results.node, 'pressure'):
+                data = st.session_state.fdi_results.node['pressure']
                 ylabel = "Pressure (m)"
+                title = "FDI Attack - Node Pressure"
             else:
-                st.error("Pressure data not available")
+                st.error("FDI attack pressure data not available")
                 return
-        elif result_type == "Link Flow":
-            if hasattr(analyzer.results.link, 'flowrate'):
-                data = analyzer.results.link['flowrate']
+        elif result_type == "DoS Attack" and has_dos:
+            if hasattr(st.session_state.dos_results.link, 'flowrate'):
+                data = st.session_state.dos_results.link['flowrate']
                 ylabel = "Flow Rate (m³/s)"
+                title = "DoS Attack - Link Flow"
             else:
-                st.error("Flow data not available")
-                return
-        elif result_type == "Node Demand":
-            if hasattr(analyzer.results.node, 'demand'):
-                data = analyzer.results.node['demand']
-                ylabel = "Demand (L/s)"
-            else:
-                st.error("Demand data not available")
+                st.error("DoS attack flow data not available")
                 return
         
         # Select specific elements to plot
@@ -1059,17 +970,17 @@ def render_results_analysis(analyzer):
                 "Select elements to display:",
                 data.columns.tolist(),
                 default=data.columns.tolist()[:min(3, len(data.columns))],
-                key="baseline_elements"
+                key="attack_elements"
             )
             
             if elements:
                 # Create IEEE style plot
                 fig = analyzer.create_ieee_plot(
                     data[elements],
-                    title=f"Baseline {result_type}",
+                    title=title,
                     xlabel="Time (hours)",
                     ylabel=ylabel,
-                    filename=f"baseline_{result_type.replace(' ', '_').lower()}"
+                    filename=f"{result_type.replace(' ', '_').lower()}_{ylabel.replace(' ', '_').lower()}"
                 )
                 st.pyplot(fig)
                 
@@ -1079,58 +990,36 @@ def render_results_analysis(analyzer):
                 st.dataframe(stats_df, use_container_width=True)
     
     with tab2:
-        st.markdown("### Attack vs Baseline Comparison")
+        st.markdown("### Attack Impact Visualization")
         
-        if not (hasattr(st.session_state, 'fdi_results') or hasattr(st.session_state, 'dos_results')):
-            st.info("No attack results available. Please run attack simulations first.")
-        else:
-            # Select attack type for comparison
-            attack_options = []
-            if hasattr(st.session_state, 'fdi_results'):
-                attack_options.append("FDI Attack")
-            if hasattr(st.session_state, 'dos_results'):
-                attack_options.append("DoS Attack")
+        if has_fdi and hasattr(analyzer, 'fdi_params') and 'normal_results' in analyzer.fdi_params:
+            st.markdown("#### FDI Attack Impact")
             
-            if attack_options:
-                attack_to_compare = st.selectbox(
-                    "Select attack for comparison:",
-                    attack_options,
-                    key="attack_comparison"
-                )
+            if hasattr(analyzer.fdi_params['normal_results'].node, 'pressure'):
+                normal_pressure = analyzer.fdi_params['normal_results'].node['pressure']
+                attack_pressure = st.session_state.fdi_results.node['pressure']
                 
-                # Select element for comparison
-                if analyzer.wn and len(analyzer.wn.node_name_list) > 0:
-                    compare_element = st.selectbox(
-                        "Select node for comparison:",
-                        analyzer.wn.node_name_list[:min(10, len(analyzer.wn.node_name_list))],
-                        key="compare_element"
+                # Select a node for comparison
+                available_nodes = list(normal_pressure.columns)[:min(5, len(normal_pressure.columns))]
+                if available_nodes:
+                    compare_node = st.selectbox(
+                        "Select node for impact analysis:",
+                        available_nodes,
+                        key="impact_node"
                     )
                     
-                    if compare_element and hasattr(analyzer.results.node, 'pressure'):
+                    if compare_node:
                         fig, ax = plt.subplots(figsize=(8, 5))
                         
-                        # Plot baseline
-                        if compare_element in analyzer.results.node['pressure'].columns:
-                            baseline = analyzer.results.node['pressure'][compare_element]
-                            ax.plot(baseline.index / 3600, baseline.values, 
-                                   label='Baseline', linewidth=2, color='#1E40AF')
-                        
-                        # Plot selected attack
-                        if attack_to_compare == "FDI Attack" and hasattr(st.session_state, 'fdi_results'):
-                            if compare_element in st.session_state.fdi_results.node['pressure'].columns:
-                                fdi_data = st.session_state.fdi_results.node['pressure'][compare_element]
-                                ax.plot(fdi_data.index / 3600, fdi_data.values, 
-                                       label='FDI Attack', linewidth=2, color='#DC2626', linestyle='--')
-                        
-                        elif attack_to_compare == "DoS Attack" and hasattr(st.session_state, 'dos_results'):
-                            if compare_element in st.session_state.dos_results.node['pressure'].columns:
-                                dos_data = st.session_state.dos_results.node['pressure'][compare_element]
-                                ax.plot(dos_data.index / 3600, dos_data.values, 
-                                       label='DoS Attack', linewidth=2, color='#059669', linestyle='-.')
+                        # Plot normal and attacked pressures
+                        ax.plot(normal_pressure.index / 3600, normal_pressure[compare_node], 
+                               label='Normal Operation', linewidth=2, color='#1E40AF')
+                        ax.plot(attack_pressure.index / 3600, attack_pressure[compare_node], 
+                               label='Under FDI Attack', linewidth=2, color='#DC2626', linestyle='--')
                         
                         ax.set_xlabel("Time (hours)", fontweight='bold')
                         ax.set_ylabel("Pressure (m)", fontweight='bold')
-                        ax.set_title(f"Pressure at Node {compare_element}", fontweight='bold')
+                        ax.set_title(f"FDI Attack Impact at Node {compare_node}", fontweight='bold')
                         ax.legend()
                         ax.grid(True, alpha=0.3, linestyle='--')
                         
@@ -1139,66 +1028,58 @@ def render_results_analysis(analyzer):
     with tab3:
         st.markdown("### Attack Impact Metrics")
         
-        if not (hasattr(st.session_state, 'fdi_results') or hasattr(st.session_state, 'dos_results')):
-            st.info("No attack results to analyze")
-        else:
-            # Calculate impact metrics
-            impact_metrics = {}
+        # Calculate impact metrics for available attacks
+        impact_metrics = {}
+        
+        if has_fdi and hasattr(analyzer, 'fdi_params') and 'normal_results' in analyzer.fdi_params:
+            # FDI impact metrics
+            normal_pressure = analyzer.fdi_params['normal_results'].node['pressure']
+            fdi_pressure = st.session_state.fdi_results.node['pressure']
             
-            if hasattr(st.session_state, 'fdi_results'):
-                # FDI impact metrics
-                if hasattr(analyzer.results.node, 'pressure') and hasattr(st.session_state.fdi_results.node, 'pressure'):
-                    baseline_pressure = analyzer.results.node['pressure']
-                    fdi_pressure = st.session_state.fdi_results.node['pressure']
-                    
-                    pressure_diff = (fdi_pressure - baseline_pressure).abs()
-                    max_deviation = pressure_diff.max().max()
-                    mean_deviation = pressure_diff.mean().mean()
-                    
-                    impact_metrics['FDI'] = {
-                        'Max Pressure Deviation (m)': max_deviation,
-                        'Mean Pressure Deviation (m)': mean_deviation,
-                        'Nodes with >1m deviation': (pressure_diff.max() > 1).sum(),
-                        'Impact Index': mean_deviation * 100
-                    }
+            pressure_diff = (fdi_pressure - normal_pressure).abs()
+            max_deviation = pressure_diff.max().max()
+            mean_deviation = pressure_diff.mean().mean()
             
-            if hasattr(st.session_state, 'dos_results'):
-                # DoS impact metrics
-                if hasattr(analyzer.results.link, 'flowrate') and hasattr(st.session_state.dos_results.link, 'flowrate'):
-                    baseline_flow = analyzer.results.link['flowrate'].abs()
-                    dos_flow = st.session_state.dos_results.link['flowrate'].abs()
-                    
-                    # Avoid division by zero
-                    baseline_flow_nonzero = baseline_flow.replace(0, np.nan)
-                    dos_flow_nonzero = dos_flow.replace(0, np.nan)
-                    
-                    if not baseline_flow_nonzero.empty:
-                        flow_reduction = ((baseline_flow_nonzero - dos_flow_nonzero) / baseline_flow_nonzero * 100)
-                        max_reduction = flow_reduction.max().max()
-                        mean_reduction = flow_reduction.mean().mean()
-                        
-                        impact_metrics['DoS'] = {
-                            'Max Flow Reduction (%)': max_reduction if not np.isnan(max_reduction) else 0,
-                            'Mean Flow Reduction (%)': mean_reduction if not np.isnan(mean_reduction) else 0,
-                            'Links with >20% Reduction': (flow_reduction.max() > 20).sum() if not flow_reduction.empty else 0,
-                            'Network Resilience Index': max(0, 100 - (mean_reduction if not np.isnan(mean_reduction) else 0))
-                        }
-            
-            # Display metrics
-            for attack_type, metrics in impact_metrics.items():
-                st.markdown(f"#### {attack_type} Impact Metrics")
-                cols = st.columns(len(metrics))
+            impact_metrics['FDI'] = {
+                'Max Pressure Deviation (m)': max_deviation,
+                'Mean Pressure Deviation (m)': mean_deviation,
+                'Nodes with >1m deviation': (pressure_diff.max() > 1).sum(),
+                'Attack Severity Index': mean_deviation * 100
+            }
+        
+        if has_dos:
+            # DoS impact metrics - simplified since we don't have baseline
+            if hasattr(st.session_state.dos_results.link, 'flowrate'):
+                dos_flow = st.session_state.dos_results.link['flowrate'].abs()
+                mean_flow = dos_flow.mean().mean()
+                std_flow = dos_flow.std().mean()
                 
-                for idx, (metric_name, value) in enumerate(metrics.items()):
-                    with cols[idx % len(cols)]:
-                        st.metric(label=metric_name, value=f"{value:.2f}")
+                impact_metrics['DoS'] = {
+                    'Mean Flow Rate (m³/s)': mean_flow,
+                    'Flow Variability (std)': std_flow,
+                    'Zero Flow Links': (dos_flow.mean() == 0).sum(),
+                    'Network Disruption Index': (dos_flow.mean() == 0).sum() / len(dos_flow.columns) * 100
+                }
+        
+        # Display metrics
+        for attack_type, metrics in impact_metrics.items():
+            st.markdown(f"#### {attack_type} Impact Metrics")
+            cols = st.columns(len(metrics))
+            
+            for idx, (metric_name, value) in enumerate(metrics.items()):
+                with cols[idx % len(cols)]:
+                    st.metric(label=metric_name, value=f"{value:.2f}")
 
 def render_export_results(analyzer):
     """Render export results section"""
     st.markdown('<h2 class="sub-header">💾 Export Results</h2>', unsafe_allow_html=True)
     
-    if not analyzer.results:
-        st.warning("No simulation results to export. Please run baseline simulation first.")
+    # Check what results are available
+    has_fdi = hasattr(st.session_state, 'fdi_results')
+    has_dos = hasattr(st.session_state, 'dos_results')
+    
+    if not (has_fdi or has_dos):
+        st.warning("No attack simulation results to export. Please run attack simulations first.")
         return
     
     col1, col2 = st.columns(2)
@@ -1213,11 +1094,18 @@ def render_export_results(analyzer):
             key="export_format"
         )
         
+        data_options = []
+        if has_fdi:
+            data_options.append("FDI Attack Results")
+        if has_dos:
+            data_options.append("DoS Attack Results")
+        data_options.append("Network Properties")
+        data_options.append("Attack Parameters")
+        
         data_to_export = st.multiselect(
             "Select data to export:",
-            ["Baseline Results", "FDI Attack Results", "DoS Attack Results", 
-             "Network Properties", "Attack Parameters"],
-            default=["Baseline Results"],
+            data_options,
+            default=data_options[:min(2, len(data_options))],
             key="data_to_export"
         )
         
@@ -1243,32 +1131,21 @@ def render_export_results(analyzer):
         with st.spinner("Preparing export..."):
             export_items = []
             
-            if "Baseline Results" in data_to_export and analyzer.results:
-                # Export pressure data
-                if hasattr(analyzer.results.node, 'pressure'):
-                    pressure_df = analyzer.results.node['pressure']
-                    if include_summary:
-                        summary_df = pressure_df.describe()
-                        export_items.append(("baseline_pressure_summary", summary_df))
-                    export_items.append(("baseline_pressure", pressure_df))
-                
-                # Export flow data
-                if hasattr(analyzer.results.link, 'flowrate'):
-                    flow_df = analyzer.results.link['flowrate']
-                    if include_summary:
-                        summary_df = flow_df.describe()
-                        export_items.append(("baseline_flow_summary", summary_df))
-                    export_items.append(("baseline_flow", flow_df))
-            
-            if "FDI Attack Results" in data_to_export and hasattr(st.session_state, 'fdi_results'):
+            if "FDI Attack Results" in data_to_export and has_fdi:
                 if hasattr(st.session_state.fdi_results.node, 'pressure'):
                     fdi_pressure = st.session_state.fdi_results.node['pressure']
+                    if include_summary:
+                        summary_df = fdi_pressure.describe()
+                        export_items.append(("fdi_pressure_summary", summary_df))
                     export_items.append(("fdi_pressure", fdi_pressure))
             
-            if "DoS Attack Results" in data_to_export and hasattr(st.session_state, 'dos_results'):
-                if hasattr(st.session_state.dos_results.node, 'pressure'):
-                    dos_pressure = st.session_state.dos_results.node['pressure']
-                    export_items.append(("dos_pressure", dos_pressure))
+            if "DoS Attack Results" in data_to_export and has_dos:
+                if hasattr(st.session_state.dos_results.link, 'flowrate'):
+                    dos_flow = st.session_state.dos_results.link['flowrate']
+                    if include_summary:
+                        summary_df = dos_flow.describe()
+                        export_items.append(("dos_flow_summary", summary_df))
+                    export_items.append(("dos_flow", dos_flow))
             
             if "Network Properties" in data_to_export and analyzer.wn:
                 props = analyzer.get_network_properties()
@@ -1277,10 +1154,11 @@ def render_export_results(analyzer):
             
             if "Attack Parameters" in data_to_export:
                 attack_params = {}
-                if hasattr(st.session_state, 'fdi_params'):
+                if has_fdi and hasattr(st.session_state, 'fdi_params'):
                     attack_params['fdi'] = st.session_state.fdi_params
-                if hasattr(st.session_state, 'dos_params'):
+                if has_dos and hasattr(st.session_state, 'dos_params'):
                     attack_params['dos'] = st.session_state.dos_params
+                
                 if attack_params:
                     # Convert to DataFrame-friendly format
                     flat_params = {}
@@ -1289,30 +1167,30 @@ def render_export_results(analyzer):
                             if isinstance(value, list):
                                 flat_params[f"{attack_type}_{key}"] = ", ".join(map(str, value))
                             else:
-                                flat_params[f"{attack_type}_{key}"] = value
+                                flat_params[f"{attack_type}_{key}"] = str(value)
                     params_df = pd.DataFrame([flat_params])
                     export_items.append(("attack_parameters", params_df))
             
             # Create download links
-            st.markdown("### Download Files")
-            
-            for data_name, data_df in export_items:
-                if isinstance(data_df, pd.DataFrame) and not data_df.empty:
-                    if export_format == "CSV":
-                        csv = data_df.to_csv()
-                        b64 = base64.b64encode(csv.encode()).decode()
-                        download_link = f'<a href="data:file/csv;base64,{b64}" download="{export_filename}_{data_name}.csv">📥 Download {data_name}.csv</a>'
-                    else:  # Excel
-                        excel_buffer = BytesIO()
-                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                            data_df.to_excel(writer, sheet_name=data_name[:31])
-                        excel_buffer.seek(0)
-                        b64 = base64.b64encode(excel_buffer.read()).decode()
-                        download_link = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{export_filename}_{data_name}.xlsx">📥 Download {data_name}.xlsx</a>'
-                    
-                    st.markdown(download_link, unsafe_allow_html=True)
-            
             if export_items:
+                st.markdown("### Download Files")
+                
+                for data_name, data_df in export_items:
+                    if isinstance(data_df, pd.DataFrame) and not data_df.empty:
+                        if export_format == "CSV":
+                            csv = data_df.to_csv()
+                            b64 = base64.b64encode(csv.encode()).decode()
+                            download_link = f'<a href="data:file/csv;base64,{b64}" download="{export_filename}_{data_name}.csv">📥 Download {data_name}.csv</a>'
+                        else:  # Excel
+                            excel_buffer = BytesIO()
+                            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                data_df.to_excel(writer, sheet_name=data_name[:31])
+                            excel_buffer.seek(0)
+                            b64 = base64.b64encode(excel_buffer.read()).decode()
+                            download_link = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{export_filename}_{data_name}.xlsx">📥 Download {data_name}.xlsx</a>'
+                        
+                        st.markdown(download_link, unsafe_allow_html=True)
+                
                 st.success("✅ Export files ready for download!")
             else:
                 st.warning("No data selected for export")
