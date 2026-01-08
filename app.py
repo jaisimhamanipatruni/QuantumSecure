@@ -8,8 +8,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
-from io import StringIO
+from io import StringIO, BytesIO
 import base64
+import tempfile
+import os
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
@@ -107,13 +109,30 @@ class WDNAnalyzer:
         self.results = None
         self.attack_results = None
         self.network_graph = None
+        self.temp_file_path = None
         
-    def load_inp_file(self, file_content):
-        """Load EPANET .inp file"""
+    def load_inp_file(self, uploaded_file):
+        """Load EPANET .inp file from uploaded file"""
         try:
-            self.wn = wntr.network.WaterNetworkModel(file_content)
+            # Save uploaded file to a temporary location
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.inp', delete=False) as tmp_file:
+                # Read the uploaded file content
+                content = uploaded_file.getvalue().decode("utf-8")
+                tmp_file.write(content)
+                self.temp_file_path = tmp_file.name
+            
+            # Load the network from the temporary file
+            self.wn = WaterNetworkModel(self.temp_file_path)
+            
+            # Clean up the temporary file
+            os.unlink(self.temp_file_path)
+            self.temp_file_path = None
+            
             return True, "File loaded successfully"
         except Exception as e:
+            # Clean up if there was an error
+            if self.temp_file_path and os.path.exists(self.temp_file_path):
+                os.unlink(self.temp_file_path)
             return False, f"Error loading file: {str(e)}"
     
     def get_network_properties(self):
@@ -216,13 +235,104 @@ class WDNAnalyzer:
         
         return dos_results, target_links
     
+    def create_network_plot(self, plot_type="Basic Network"):
+        """Create network visualization plot"""
+        try:
+            if not self.wn:
+                return None
+                
+            fig, ax = plt.subplots(figsize=(10, 8))
+            
+            if plot_type == "Basic Network":
+                # Get node coordinates
+                pos = {}
+                for node_name in self.wn.node_name_list:
+                    node = self.wn.get_node(node_name)
+                    if hasattr(node, 'coordinates') and node.coordinates:
+                        pos[node_name] = (node.coordinates[0], node.coordinates[1])
+                    else:
+                        # Generate random layout if no coordinates
+                        pos = nx.spring_layout(self.wn.get_graph())
+                        break
+                
+                # Create graph
+                G = self.wn.get_graph()
+                
+                # Draw nodes
+                node_colors = []
+                for node in G.nodes():
+                    if 'JUNCTION' in str(type(self.wn.get_node(node))).upper():
+                        node_colors.append('blue')
+                    elif 'RESERVOIR' in str(type(self.wn.get_node(node))).upper():
+                        node_colors.append('green')
+                    elif 'TANK' in str(type(self.wn.get_node(node))).upper():
+                        node_colors.append('orange')
+                    else:
+                        node_colors.append('gray')
+                
+                nx.draw_networkx_nodes(G, pos, node_color=node_colors, 
+                                      node_size=100, ax=ax)
+                nx.draw_networkx_edges(G, pos, width=1.5, alpha=0.7, ax=ax)
+                nx.draw_networkx_labels(G, pos, font_size=8, ax=ax)
+                
+                ax.set_title("Water Distribution Network Topology", fontweight='bold')
+                ax.set_aspect('equal')
+                
+            elif plot_type == "Pressure Distribution" and self.results is not None:
+                # Get pressure at last time step
+                if hasattr(self.results.node, 'pressure'):
+                    pressure = self.results.node['pressure'].iloc[-1]
+                    
+                    # Get coordinates
+                    pos = {}
+                    for node_name in self.wn.node_name_list:
+                        node = self.wn.get_node(node_name)
+                        if hasattr(node, 'coordinates') and node.coordinates:
+                            pos[node_name] = (node.coordinates[0], node.coordinates[1])
+                        else:
+                            pos = nx.spring_layout(self.wn.get_graph())
+                            break
+                    
+                    G = self.wn.get_graph()
+                    
+                    # Map pressure to colors
+                    node_values = []
+                    for node in G.nodes():
+                        if node in pressure.index:
+                            node_values.append(pressure[node])
+                        else:
+                            node_values.append(0)
+                    
+                    nodes = nx.draw_networkx_nodes(G, pos, node_color=node_values, 
+                                                  node_size=100, cmap=plt.cm.viridis,
+                                                  ax=ax)
+                    nx.draw_networkx_edges(G, pos, width=1, alpha=0.5, ax=ax)
+                    nx.draw_networkx_labels(G, pos, font_size=6, ax=ax)
+                    
+                    # Add colorbar
+                    plt.colorbar(nodes, ax=ax, label='Pressure (m)')
+                    ax.set_title("Pressure Distribution", fontweight='bold')
+                    ax.set_aspect('equal')
+            
+            return fig
+            
+        except Exception as e:
+            st.error(f"Error creating plot: {str(e)}")
+            # Create a simple fallback plot
+            fig, ax = plt.subplots(figsize=(10, 8))
+            if self.wn:
+                G = self.wn.get_graph()
+                nx.draw(G, ax=ax, with_labels=True, node_size=50, font_size=6)
+                ax.set_title("Network Topology (Simplified)", fontweight='bold')
+            return fig
+    
     def create_ieee_plot(self, data, title, xlabel, ylabel, filename):
         """Create IEEE style publication plot"""
         fig, ax = plt.subplots(figsize=(6, 4))
         
         if isinstance(data, pd.DataFrame):
-            for column in data.columns:
-                ax.plot(data.index / 3600, data[column], linewidth=1.5, alpha=0.8)
+            for column in data.columns[:5]:  # Limit to first 5 columns for clarity
+                ax.plot(data.index / 3600, data[column], linewidth=1.5, alpha=0.8, label=str(column))
         elif isinstance(data, pd.Series):
             ax.plot(data.index / 3600, data.values, linewidth=1.5, color='#1E40AF')
         
@@ -230,7 +340,8 @@ class WDNAnalyzer:
         ax.set_ylabel(ylabel, fontweight='bold')
         ax.set_title(title, fontsize=11, fontweight='bold')
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='best', frameon=True, fancybox=True, shadow=True)
+        if isinstance(data, pd.DataFrame) and len(data.columns) <= 5:
+            ax.legend(loc='best', frameon=True, fancybox=True, shadow=True)
         
         # IEEE style adjustments
         ax.spines['top'].set_visible(False)
@@ -278,7 +389,7 @@ def main():
         st.markdown("### Settings")
         
         if analyzer.wn:
-            st.info(f"Network Loaded: {analyzer.wn.name}")
+            st.info(f"Network Loaded: {analyzer.wn.name if hasattr(analyzer.wn, 'name') else 'Unknown Network'}")
         
         st.markdown("---")
         st.markdown("""
@@ -313,12 +424,12 @@ def render_upload_overview(analyzer):
         uploaded_file = st.file_uploader("Choose an EPANET .inp file", type="inp")
         
         if uploaded_file is not None:
-            # Read file content
-            stringio = StringIO(uploaded_file.getvalue().decode("utf-8"))
-            file_content = stringio.read()
+            # Display file info
+            file_details = {"Filename": uploaded_file.name, "FileSize": uploaded_file.size}
+            st.write(file_details)
             
             # Load network
-            success, message = analyzer.load_inp_file(file_content)
+            success, message = analyzer.load_inp_file(uploaded_file)
             
             if success:
                 st.success(message)
@@ -327,24 +438,36 @@ def render_upload_overview(analyzer):
                 st.markdown('<h3 class="sub-header">Network Properties</h3>', unsafe_allow_html=True)
                 
                 properties = analyzer.get_network_properties()
-                cols = st.columns(3)
                 
-                for idx, (key, value) in enumerate(properties.items()):
-                    with cols[idx % 3]:
-                        st.markdown(f"""
-                        <div class="metric-card">
-                            <div style="font-size: 0.9rem; color: #6B7280;">{key}</div>
-                            <div style="font-size: 1.5rem; font-weight: 700; color: #1E40AF;">{value}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                # Display metrics in a grid
+                col1, col2, col3 = st.columns(3)
+                metrics = list(properties.items())
+                
+                for i in range(0, len(metrics), 3):
+                    cols = st.columns(3)
+                    for j in range(3):
+                        if i + j < len(metrics):
+                            key, value = metrics[i + j]
+                            with cols[j]:
+                                st.markdown(f"""
+                                <div class="metric-card">
+                                    <div style="font-size: 0.9rem; color: #6B7280;">{key}</div>
+                                    <div style="font-size: 1.5rem; font-weight: 700; color: #1E40AF;">{value}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
                 
                 # Run baseline simulation
-                if st.button("🚀 Run Baseline Simulation", type="primary"):
+                if st.button("🚀 Run Baseline Simulation", type="primary", use_container_width=True):
                     with st.spinner("Running hydraulic simulation..."):
                         results = analyzer.simulate_hydraulics()
-                        if results:
+                        if results is not None:
                             st.success("Baseline simulation completed successfully!")
                             st.session_state.baseline_completed = True
+                            
+                            # Show quick results
+                            if hasattr(results.node, 'pressure'):
+                                avg_pressure = results.node['pressure'].mean().mean()
+                                st.metric("Average Network Pressure", f"{avg_pressure:.2f} m")
                 
             else:
                 st.error(message)
@@ -352,21 +475,22 @@ def render_upload_overview(analyzer):
     with col2:
         st.markdown("### Sample Networks")
         st.markdown("""
-        Don't have an .inp file? Try these examples:
+        Try these standard EPANET examples:
         
-        1. **Net3.inp** - Standard EPANET example
-        2. **BWSN.inp** - Battle of Water Networks
-        3. **Richmond.inp** - Medium-sized network
+        1. **Net3.inp** 
+        2. **BWSN_Network_1.inp**
+        3. **Anytown.inp**
         
-        *Download from [EPANET Website](https://epanet.es)*
+        *Available from EPANET examples*
         """)
         
-        st.markdown("### Requirements")
+        st.markdown("### Quick Start")
         st.markdown("""
-        - EPANET .inp format
-        - Complete network definition
-        - Proper node and link IDs
-        - Control rules (optional)
+        1. Upload .inp file
+        2. Run baseline simulation
+        3. Visualize network
+        4. Simulate attacks
+        5. Export results
         """)
 
 def render_visualization(analyzer):
@@ -375,6 +499,7 @@ def render_visualization(analyzer):
     
     if not analyzer.wn:
         st.warning("Please upload an EPANET .inp file first")
+        st.info("Go to '📁 Upload & Overview' to load your network model")
         return
     
     col1, col2 = st.columns([3, 1])
@@ -385,87 +510,47 @@ def render_visualization(analyzer):
         
         plot_type = st.selectbox(
             "Select visualization type:",
-            ["Basic Network", "Pressure Distribution", "Flow Distribution", "Elevation Profile"]
+            ["Basic Network", "Pressure Distribution"]
         )
         
-        # Create network graph
-        try:
-            fig, ax = plt.subplots(figsize=(10, 8))
-            
-            if plot_type == "Basic Network":
-                # Simple network plot
-                G = analyzer.wn.get_graph()
-                pos = {node: (analyzer.wn.get_node(node).coordinates[0], 
-                             analyzer.wn.get_node(node).coordinates[1]) 
-                      for node in G.nodes()}
-                
-                nx.draw(G, pos, ax=ax, node_size=50, node_color='blue', 
-                       edge_color='gray', width=2, with_labels=True, 
-                       font_size=8)
-                ax.set_title("Water Distribution Network Topology", fontweight='bold')
-            
-            elif plot_type == "Pressure Distribution" and analyzer.results:
-                # Pressure contour
-                pressure = analyzer.results.node['pressure'].iloc[-1]
-                G = analyzer.wn.get_graph()
-                
-                node_colors = []
-                for node in G.nodes():
-                    if node in pressure:
-                        node_colors.append(pressure[node])
-                    else:
-                        node_colors.append(0)
-                
-                pos = {node: (analyzer.wn.get_node(node).coordinates[0], 
-                             analyzer.wn.get_node(node).coordinates[1]) 
-                      for node in G.nodes()}
-                
-                nodes = nx.draw_networkx_nodes(G, pos, node_color=node_colors, 
-                                              node_size=100, cmap=plt.cm.viridis, 
-                                              ax=ax)
-                edges = nx.draw_networkx_edges(G, pos, width=1, alpha=0.5, ax=ax)
-                
-                plt.colorbar(nodes, label='Pressure (m)', ax=ax)
-                ax.set_title("Pressure Distribution at Final Time Step", fontweight='bold')
-            
-            ax.set_aspect('equal')
+        # Create and display plot
+        fig = analyzer.create_network_plot(plot_type)
+        if fig:
             st.pyplot(fig)
             
-        except Exception as e:
-            st.error(f"Error generating visualization: {str(e)}")
-            # Fallback to simple plot
-            st.info("Using simplified network representation")
-            G = analyzer.wn.get_graph()
-            fig, ax = plt.subplots(figsize=(10, 8))
-            nx.draw(G, ax=ax, node_size=30, with_labels=False)
-            st.pyplot(fig)
+            # Download button for the plot
+            buf = BytesIO()
+            fig.savefig(buf, format="png", dpi=300, bbox_inches='tight')
+            buf.seek(0)
+            
+            st.download_button(
+                label="📥 Download Plot",
+                data=buf,
+                file_name=f"network_visualization_{plot_type.replace(' ', '_')}.png",
+                mime="image/png"
+            )
     
     with col2:
         st.markdown("### Visualization Settings")
         
-        # Node selection
+        # Node information
         if analyzer.wn:
-            nodes = analyzer.wn.node_name_list
-            selected_nodes = st.multiselect(
-                "Highlight nodes:",
-                nodes,
-                default=nodes[:min(5, len(nodes))]
-            )
+            nodes = list(analyzer.wn.node_name_list)
+            st.metric("Total Nodes", len(nodes))
             
-            # Link selection
-            links = analyzer.wn.link_name_list
-            selected_links = st.multiselect(
-                "Highlight links:",
-                links,
-                default=links[:min(5, len(links))]
-            )
+            links = list(analyzer.wn.link_name_list)
+            st.metric("Total Links", len(links))
         
-        # Plot customization
-        st.markdown("#### Customization")
-        node_size = st.slider("Node size", 10, 200, 50)
-        line_width = st.slider("Line width", 0.5, 5.0, 2.0)
+        # Color scheme
+        st.markdown("#### Color Legend")
+        st.markdown("""
+        - 🔵 **Blue**: Junctions
+        - 🟢 **Green**: Reservoirs
+        - 🟠 **Orange**: Tanks
+        - ⚫ **Black**: Pipes
+        """)
         
-        if st.button("🔄 Refresh Visualization"):
+        if st.button("🔄 Refresh View", use_container_width=True):
             st.rerun()
 
 def render_attack_simulation(analyzer):
@@ -473,11 +558,11 @@ def render_attack_simulation(analyzer):
     st.markdown('<h2 class="sub-header">⚡ Attack Simulation</h2>', unsafe_allow_html=True)
     
     if not analyzer.wn:
-        st.warning("Please upload an EPANET .inp file and run baseline simulation first")
+        st.warning("Please upload an EPANET .inp file first")
         return
     
-    if not hasattr(st.session_state, 'baseline_completed'):
-        st.warning("Please run baseline simulation first")
+    if 'baseline_completed' not in st.session_state:
+        st.warning("Please run baseline simulation first in '📁 Upload & Overview'")
         return
     
     tab1, tab2 = st.tabs(["🔓 False Data Injection (FDI)", "🚫 Denial of Service (DoS)"])
@@ -498,53 +583,70 @@ def render_attack_simulation(analyzer):
             
             attack_type = st.selectbox(
                 "Attack type:",
-                ["Pressure Manipulation", "Flow Manipulation", "Demand Manipulation"]
+                ["Pressure Manipulation", "Flow Manipulation"]
             )
             
             attack_magnitude = st.slider(
-                "Attack magnitude (%):",
-                0, 100, 30,
-                help="Percentage of deviation from actual values"
+                "Attack magnitude:",
+                0.0, 1.0, 0.3, 0.05,
+                help="Magnitude of false data injection (0-1 scale)"
+            )
+            
+            attack_start = st.slider(
+                "Attack start time (hours):",
+                0, 24, 6
             )
             
             attack_duration = st.slider(
                 "Attack duration (hours):",
-                1, 24, 6
+                1, 12, 6
             )
         
         with col2:
             # Target selection
             st.markdown("#### Target Selection")
             
-            target_nodes = st.multiselect(
-                "Select nodes to attack:",
-                analyzer.wn.node_name_list,
-                help="Select specific nodes for targeted attack"
-            )
-            
-            if not target_nodes:
-                st.info("No nodes selected. Random nodes will be attacked.")
-                n_random = st.slider("Number of random nodes:", 1, 20, 5)
-                target_nodes = None
+            if analyzer.wn:
+                nodes = list(analyzer.wn.node_name_list)
+                
+                attack_strategy = st.radio(
+                    "Attack strategy:",
+                    ["Random nodes", "Specific nodes", "Critical nodes (high demand)"]
+                )
+                
+                if attack_strategy == "Specific nodes":
+                    target_nodes = st.multiselect(
+                        "Select nodes to attack:",
+                        nodes
+                    )
+                else:
+                    if attack_strategy == "Random nodes":
+                        n_attack = st.slider("Number of nodes to attack:", 1, min(20, len(nodes)), 3)
+                        target_nodes = None
+                    else:
+                        # For critical nodes, select nodes with highest base demand
+                        n_attack = st.slider("Number of critical nodes:", 1, min(10, len(nodes)), 3)
+                        target_nodes = None
         
         # Run FDI attack
-        if st.button("🚨 Simulate FDI Attack", type="primary"):
+        if st.button("🚨 Simulate FDI Attack", type="primary", use_container_width=True):
             with st.spinner("Simulating FDI attack..."):
-                # Convert attack parameters
-                magnitude = attack_magnitude / 100.0
+                # Prepare target nodes if not specified
+                if target_nodes is None and analyzer.wn:
+                    nodes = list(analyzer.wn.node_name_list)
+                    if attack_strategy == "Random nodes":
+                        target_nodes = list(np.random.choice(nodes, n_attack, replace=False))
+                    elif attack_strategy == "Critical nodes (high demand)":
+                        # Simple heuristic: use all nodes
+                        target_nodes = nodes[:n_attack]
                 
-                if attack_type == "Pressure Manipulation":
-                    attack_results = analyzer.simulate_fdi_attack(
-                        target_nodes=target_nodes,
-                        attack_magnitude=magnitude,
-                        attack_type='pressure'
-                    )
-                elif attack_type == "Flow Manipulation":
-                    attack_results = analyzer.simulate_fdi_attack(
-                        target_nodes=target_nodes,
-                        attack_magnitude=magnitude,
-                        attack_type='flow'
-                    )
+                # Run attack simulation
+                attack_type_param = 'pressure' if 'Pressure' in attack_type else 'flow'
+                attack_results = analyzer.simulate_fdi_attack(
+                    target_nodes=target_nodes,
+                    attack_magnitude=attack_magnitude,
+                    attack_type=attack_type_param
+                )
                 
                 if attack_results is not None:
                     st.session_state.fdi_results = attack_results
@@ -552,7 +654,8 @@ def render_attack_simulation(analyzer):
                         'type': attack_type,
                         'magnitude': attack_magnitude,
                         'duration': attack_duration,
-                        'targets': target_nodes
+                        'targets': target_nodes,
+                        'strategy': attack_strategy
                     }
                     st.success("FDI attack simulation completed!")
                     
@@ -560,13 +663,26 @@ def render_attack_simulation(analyzer):
                     if analyzer.results and hasattr(st.session_state, 'fdi_results'):
                         baseline_pressure = analyzer.results.node['pressure'].mean().mean()
                         attack_pressure = st.session_state.fdi_results.node['pressure'].mean().mean()
-                        impact = abs((attack_pressure - baseline_pressure) / baseline_pressure * 100)
+                        pressure_change = attack_pressure - baseline_pressure
+                        impact_percent = abs((pressure_change) / baseline_pressure * 100) if baseline_pressure != 0 else 0
                         
-                        st.metric(
-                            label="Pressure Impact",
-                            value=f"{impact:.2f}%",
-                            delta=f"{attack_pressure - baseline_pressure:.2f} m"
-                        )
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric(
+                                label="Pressure Change",
+                                value=f"{pressure_change:.2f} m",
+                                delta=f"{impact_percent:.1f}%"
+                            )
+                        with col2:
+                            st.metric(
+                                label="Nodes Attacked",
+                                value=len(target_nodes) if target_nodes else n_attack
+                            )
+                        with col3:
+                            st.metric(
+                                label="Attack Duration",
+                                value=f"{attack_duration}h"
+                            )
     
     with tab2:
         st.markdown("""
@@ -583,7 +699,7 @@ def render_attack_simulation(analyzer):
             
             dos_type = st.selectbox(
                 "DoS type:",
-                ["Pipe Closure", "Pump Failure", "Valve Manipulation", "Tank Isolation"]
+                ["Pipe Closure", "Pump Failure"]
             )
             
             attack_severity = st.slider(
@@ -600,19 +716,40 @@ def render_attack_simulation(analyzer):
         with col2:
             st.markdown("#### Target Selection")
             
-            target_links = st.multiselect(
-                "Select links to disable:",
-                analyzer.wn.link_name_list,
-                help="Select specific links to simulate closure"
-            )
-            
-            if not target_links and dos_type == "Pipe Closure":
-                n_random = st.slider("Number of random pipes:", 1, 10, 3)
-                target_links = None
+            if analyzer.wn:
+                links = list(analyzer.wn.link_name_list)
+                
+                dos_strategy = st.radio(
+                    "Attack strategy:",
+                    ["Random links", "Specific links", "Critical pipes (longest)"]
+                )
+                
+                if dos_strategy == "Specific links":
+                    target_links = st.multiselect(
+                        "Select links to disable:",
+                        links
+                    )
+                else:
+                    if dos_strategy == "Random links":
+                        n_attack = st.slider("Number of links to attack:", 1, min(10, len(links)), 3)
+                        target_links = None
+                    else:
+                        # For critical pipes, select longest pipes
+                        n_attack = st.slider("Number of critical links:", 1, min(5, len(links)), 2)
+                        target_links = None
         
         # Run DoS attack
-        if st.button("🚨 Simulate DoS Attack", type="primary"):
+        if st.button("🚨 Simulate DoS Attack", type="primary", use_container_width=True):
             with st.spinner("Simulating DoS attack..."):
+                # Prepare target links if not specified
+                if target_links is None and analyzer.wn:
+                    links = list(analyzer.wn.link_name_list)
+                    if dos_strategy == "Random links":
+                        target_links = list(np.random.choice(links, n_attack, replace=False))
+                    elif dos_strategy == "Critical pipes (longest)":
+                        # Simple heuristic: use first n links
+                        target_links = links[:n_attack]
+                
                 dos_results, attacked_links = analyzer.simulate_dos_attack(
                     target_links=target_links,
                     attack_duration=recovery_time
@@ -624,7 +761,8 @@ def render_attack_simulation(analyzer):
                     st.session_state.dos_params = {
                         'type': dos_type,
                         'severity': attack_severity,
-                        'recovery': recovery_time
+                        'recovery': recovery_time,
+                        'strategy': dos_strategy
                     }
                     st.success(f"DoS attack simulation completed! {len(attacked_links)} links disabled.")
                     
@@ -632,7 +770,7 @@ def render_attack_simulation(analyzer):
                     if analyzer.results:
                         baseline_flow = analyzer.results.link['flowrate'].abs().mean().mean()
                         dos_flow = dos_results.link['flowrate'].abs().mean().mean()
-                        flow_reduction = ((baseline_flow - dos_flow) / baseline_flow * 100)
+                        flow_reduction = ((baseline_flow - dos_flow) / baseline_flow * 100) if baseline_flow != 0 else 0
                         
                         col1, col2, col3 = st.columns(3)
                         with col1:
@@ -643,14 +781,18 @@ def render_attack_simulation(analyzer):
                             )
                         with col2:
                             st.metric(
-                                label="Links Affected",
+                                label="Links Disabled",
                                 value=len(attacked_links)
                             )
                         with col3:
                             affected_nodes = set()
                             for link in attacked_links:
-                                link_obj = analyzer.wn.get_link(link)
-                                affected_nodes.update([link_obj.start_node, link_obj.end_node])
+                                try:
+                                    link_obj = analyzer.wn.get_link(link)
+                                    affected_nodes.add(link_obj.start_node_name)
+                                    affected_nodes.add(link_obj.end_node_name)
+                                except:
+                                    pass
                             st.metric(
                                 label="Nodes Affected",
                                 value=len(affected_nodes)
@@ -672,41 +814,54 @@ def render_results_analysis(analyzer):
         # Select results to display
         result_type = st.selectbox(
             "Select result type:",
-            ["Node Pressure", "Link Flow", "Node Demand", "Link Velocity"]
+            ["Node Pressure", "Link Flow", "Node Demand"]
         )
         
         if result_type == "Node Pressure":
-            data = analyzer.results.node['pressure']
-            ylabel = "Pressure (m)"
+            if hasattr(analyzer.results.node, 'pressure'):
+                data = analyzer.results.node['pressure']
+                ylabel = "Pressure (m)"
+            else:
+                st.error("Pressure data not available")
+                return
         elif result_type == "Link Flow":
-            data = analyzer.results.link['flowrate']
-            ylabel = "Flow Rate (m³/s)"
+            if hasattr(analyzer.results.link, 'flowrate'):
+                data = analyzer.results.link['flowrate']
+                ylabel = "Flow Rate (m³/s)"
+            else:
+                st.error("Flow data not available")
+                return
         elif result_type == "Node Demand":
-            data = analyzer.results.node['demand']
-            ylabel = "Demand (L/s)"
+            if hasattr(analyzer.results.node, 'demand'):
+                data = analyzer.results.node['demand']
+                ylabel = "Demand (L/s)"
+            else:
+                st.error("Demand data not available")
+                return
         
         # Select specific elements to plot
-        elements = st.multiselect(
-            "Select elements to display:",
-            data.columns.tolist(),
-            default=data.columns.tolist()[:min(5, len(data.columns))]
-        )
-        
-        if elements:
-            # Create IEEE style plot
-            fig = analyzer.create_ieee_plot(
-                data[elements],
-                title=f"Baseline {result_type}",
-                xlabel="Time (hours)",
-                ylabel=ylabel,
-                filename=f"baseline_{result_type.replace(' ', '_').lower()}"
+        if len(data.columns) > 0:
+            elements = st.multiselect(
+                "Select elements to display:",
+                data.columns.tolist(),
+                default=data.columns.tolist()[:min(3, len(data.columns))]
             )
-            st.pyplot(fig)
             
-            # Statistics
-            st.markdown("#### Statistical Summary")
-            stats_df = data[elements].describe()
-            st.dataframe(stats_df, use_container_width=True)
+            if elements:
+                # Create IEEE style plot
+                fig = analyzer.create_ieee_plot(
+                    data[elements],
+                    title=f"Baseline {result_type}",
+                    xlabel="Time (hours)",
+                    ylabel=ylabel,
+                    filename=f"baseline_{result_type.replace(' ', '_').lower()}"
+                )
+                st.pyplot(fig)
+                
+                # Statistics
+                st.markdown("#### Statistical Summary")
+                stats_df = data[elements].describe()
+                st.dataframe(stats_df, use_container_width=True)
     
     with tab2:
         st.markdown("### Attack vs Baseline Comparison")
@@ -715,49 +870,53 @@ def render_results_analysis(analyzer):
             st.info("No attack results available. Please run attack simulations first.")
         else:
             # Select attack type for comparison
+            attack_options = []
+            if hasattr(st.session_state, 'fdi_results'):
+                attack_options.append("FDI Attack")
+            if hasattr(st.session_state, 'dos_results'):
+                attack_options.append("DoS Attack")
+            
             attack_to_compare = st.selectbox(
                 "Select attack for comparison:",
-                ["FDI Attack", "DoS Attack", "Both Attacks"]
+                attack_options
             )
             
-            # Comparison plot
-            compare_element = st.selectbox(
-                "Select element for comparison:",
-                analyzer.wn.node_name_list[:10] if analyzer.wn else []
-            )
-            
-            if compare_element and analyzer.results:
-                fig, ax = plt.subplots(figsize=(8, 5))
+            # Select element for comparison
+            if analyzer.wn and len(analyzer.wn.node_name_list) > 0:
+                compare_element = st.selectbox(
+                    "Select node for comparison:",
+                    analyzer.wn.node_name_list[:min(10, len(analyzer.wn.node_name_list))]
+                )
                 
-                # Plot baseline
-                if compare_element in analyzer.results.node['pressure'].columns:
-                    baseline = analyzer.results.node['pressure'][compare_element]
-                    ax.plot(baseline.index / 3600, baseline.values, 
-                           label='Baseline', linewidth=2, color='#1E40AF')
-                
-                # Plot FDI attack
-                if (attack_to_compare in ["FDI Attack", "Both Attacks"] and 
-                    hasattr(st.session_state, 'fdi_results') and
-                    compare_element in st.session_state.fdi_results.node['pressure'].columns):
-                    fdi_data = st.session_state.fdi_results.node['pressure'][compare_element]
-                    ax.plot(fdi_data.index / 3600, fdi_data.values, 
-                           label='FDI Attack', linewidth=2, color='#DC2626', linestyle='--')
-                
-                # Plot DoS attack
-                if (attack_to_compare in ["DoS Attack", "Both Attacks"] and 
-                    hasattr(st.session_state, 'dos_results') and
-                    compare_element in st.session_state.dos_results.node['pressure'].columns):
-                    dos_data = st.session_state.dos_results.node['pressure'][compare_element]
-                    ax.plot(dos_data.index / 3600, dos_data.values, 
-                           label='DoS Attack', linewidth=2, color='#059669', linestyle='-.')
-                
-                ax.set_xlabel("Time (hours)", fontweight='bold')
-                ax.set_ylabel("Pressure (m)", fontweight='bold')
-                ax.set_title(f"Comparison for Node {compare_element}", fontweight='bold')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-                
-                st.pyplot(fig)
+                if compare_element and hasattr(analyzer.results.node, 'pressure'):
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    
+                    # Plot baseline
+                    if compare_element in analyzer.results.node['pressure'].columns:
+                        baseline = analyzer.results.node['pressure'][compare_element]
+                        ax.plot(baseline.index / 3600, baseline.values, 
+                               label='Baseline', linewidth=2, color='#1E40AF')
+                    
+                    # Plot selected attack
+                    if attack_to_compare == "FDI Attack" and hasattr(st.session_state, 'fdi_results'):
+                        if compare_element in st.session_state.fdi_results.node['pressure'].columns:
+                            fdi_data = st.session_state.fdi_results.node['pressure'][compare_element]
+                            ax.plot(fdi_data.index / 3600, fdi_data.values, 
+                                   label='FDI Attack', linewidth=2, color='#DC2626', linestyle='--')
+                    
+                    elif attack_to_compare == "DoS Attack" and hasattr(st.session_state, 'dos_results'):
+                        if compare_element in st.session_state.dos_results.node['pressure'].columns:
+                            dos_data = st.session_state.dos_results.node['pressure'][compare_element]
+                            ax.plot(dos_data.index / 3600, dos_data.values, 
+                                   label='DoS Attack', linewidth=2, color='#059669', linestyle='-.')
+                    
+                    ax.set_xlabel("Time (hours)", fontweight='bold')
+                    ax.set_ylabel("Pressure (m)", fontweight='bold')
+                    ax.set_title(f"Pressure at Node {compare_element}", fontweight='bold')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                    
+                    st.pyplot(fig)
     
     with tab3:
         st.markdown("### Attack Impact Metrics")
@@ -774,11 +933,14 @@ def render_results_analysis(analyzer):
                 fdi_pressure = st.session_state.fdi_results.node['pressure']
                 
                 pressure_diff = (fdi_pressure - baseline_pressure).abs()
+                max_deviation = pressure_diff.max().max()
+                mean_deviation = pressure_diff.mean().mean()
+                
                 impact_metrics['FDI'] = {
-                    'Max Pressure Deviation (m)': pressure_diff.max().max(),
-                    'Mean Pressure Deviation (m)': pressure_diff.mean().mean(),
-                    'Nodes Above Threshold': (pressure_diff.max() > 5).sum(),
-                    'Time Above Threshold (hrs)': (pressure_diff.max(axis=1) > 5).sum() / 4
+                    'Max Pressure Deviation (m)': max_deviation,
+                    'Mean Pressure Deviation (m)': mean_deviation,
+                    'Nodes with >1m deviation': (pressure_diff.max() > 1).sum(),
+                    'Impact Index': mean_deviation * 100
                 }
             
             if hasattr(st.session_state, 'dos_results'):
@@ -787,11 +949,14 @@ def render_results_analysis(analyzer):
                 dos_flow = st.session_state.dos_results.link['flowrate'].abs()
                 
                 flow_reduction = ((baseline_flow - dos_flow) / baseline_flow.replace(0, 1e-6) * 100)
+                max_reduction = flow_reduction.max().max()
+                mean_reduction = flow_reduction.mean().mean()
+                
                 impact_metrics['DoS'] = {
-                    'Max Flow Reduction (%)': flow_reduction.max().max(),
-                    'Mean Flow Reduction (%)': flow_reduction.mean().mean(),
-                    'Links with >50% Reduction': (flow_reduction.max() > 50).sum(),
-                    'Network Serviceability Index': 100 - flow_reduction.mean().mean()
+                    'Max Flow Reduction (%)': max_reduction,
+                    'Mean Flow Reduction (%)': mean_reduction,
+                    'Links with >20% Reduction': (flow_reduction.max() > 20).sum(),
+                    'Network Resilience Index': max(0, 100 - mean_reduction)
                 }
             
             # Display metrics
@@ -819,13 +984,13 @@ def render_export_results(analyzer):
         # Export options
         export_format = st.selectbox(
             "Select export format:",
-            ["CSV", "Excel", "JSON", "Pickle"]
+            ["CSV", "Excel"]
         )
         
         data_to_export = st.multiselect(
             "Select data to export:",
             ["Baseline Results", "FDI Attack Results", "DoS Attack Results", 
-             "Network Properties", "Attack Parameters", "Impact Metrics"],
+             "Network Properties", "Attack Parameters"],
             default=["Baseline Results"]
         )
         
@@ -837,36 +1002,44 @@ def render_export_results(analyzer):
     with col2:
         st.markdown("### Export Settings")
         
-        include_metadata = st.checkbox("Include metadata", value=True)
-        compress_data = st.checkbox("Compress data", value=False)
-        split_by_type = st.checkbox("Split files by data type", value=True)
+        include_summary = st.checkbox("Include summary statistics", value=True)
+        timestamp_in_filename = st.checkbox("Add timestamp to filename", value=True)
         
-        resolution = st.slider(
-            "Plot resolution (DPI):",
-            100, 600, 300
-        )
-        
-        plt.rcParams['savefig.dpi'] = resolution
+        if timestamp_in_filename:
+            export_filename = f"{filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        else:
+            export_filename = filename
     
     # Export button
-    if st.button("📥 Export All Data", type="primary"):
+    if st.button("📥 Export Data", type="primary", use_container_width=True):
         with st.spinner("Preparing export..."):
-            export_data = {}
+            export_items = []
             
             if "Baseline Results" in data_to_export and analyzer.results:
-                export_data['baseline_pressure'] = analyzer.results.node['pressure']
-                export_data['baseline_flow'] = analyzer.results.link['flowrate']
-                export_data['baseline_demand'] = analyzer.results.node['demand']
+                # Export pressure data
+                if hasattr(analyzer.results.node, 'pressure'):
+                    pressure_df = analyzer.results.node['pressure']
+                    export_items.append(("baseline_pressure", pressure_df))
+                
+                # Export flow data
+                if hasattr(analyzer.results.link, 'flowrate'):
+                    flow_df = analyzer.results.link['flowrate']
+                    export_items.append(("baseline_flow", flow_df))
             
             if "FDI Attack Results" in data_to_export and hasattr(st.session_state, 'fdi_results'):
-                export_data['fdi_pressure'] = st.session_state.fdi_results.node['pressure']
+                if hasattr(st.session_state.fdi_results.node, 'pressure'):
+                    fdi_pressure = st.session_state.fdi_results.node['pressure']
+                    export_items.append(("fdi_pressure", fdi_pressure))
             
             if "DoS Attack Results" in data_to_export and hasattr(st.session_state, 'dos_results'):
-                export_data['dos_pressure'] = st.session_state.dos_results.node['pressure']
-                export_data['dos_flow'] = st.session_state.dos_results.link['flowrate']
+                if hasattr(st.session_state.dos_results.node, 'pressure'):
+                    dos_pressure = st.session_state.dos_results.node['pressure']
+                    export_items.append(("dos_pressure", dos_pressure))
             
             if "Network Properties" in data_to_export and analyzer.wn:
-                export_data['network_properties'] = pd.DataFrame([analyzer.get_network_properties()])
+                props = analyzer.get_network_properties()
+                props_df = pd.DataFrame([props])
+                export_items.append(("network_properties", props_df))
             
             if "Attack Parameters" in data_to_export:
                 attack_params = {}
@@ -875,50 +1048,29 @@ def render_export_results(analyzer):
                 if hasattr(st.session_state, 'dos_params'):
                     attack_params['dos'] = st.session_state.dos_params
                 if attack_params:
-                    export_data['attack_parameters'] = pd.json_normalize(attack_params)
+                    params_df = pd.json_normalize(attack_params)
+                    export_items.append(("attack_parameters", params_df))
             
-            # Create plots for export
-            if analyzer.results:
-                st.markdown("### Generated Plots")
-                
-                # Create and display sample plots
-                fig1 = analyzer.create_ieee_plot(
-                    analyzer.results.node['pressure'].iloc[:, :3],
-                    title="Sample Pressure Plot",
-                    xlabel="Time (hours)",
-                    ylabel="Pressure (m)",
-                    filename="sample_pressure"
-                )
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.pyplot(fig1)
-                    st.download_button(
-                        label="Download Pressure Plot",
-                        data=fig_to_bytes(fig1),
-                        file_name=f"{filename}_pressure_plot.png",
-                        mime="image/png"
-                    )
-                
-                # Create download links for data
-                st.markdown("### Download Data Files")
-                
-                for data_name, data in export_data.items():
-                    if isinstance(data, pd.DataFrame):
-                        csv = data.to_csv()
+            # Create download links
+            st.markdown("### Download Files")
+            
+            for data_name, data_df in export_items:
+                if isinstance(data_df, pd.DataFrame):
+                    if export_format == "CSV":
+                        csv = data_df.to_csv()
                         b64 = base64.b64encode(csv.encode()).decode()
-                        download_link = f'<a href="data:file/csv;base64,{b64}" download="{filename}_{data_name}.csv">Download {data_name}.csv</a>'
-                        st.markdown(download_link, unsafe_allow_html=True)
+                        download_link = f'<a href="data:file/csv;base64,{b64}" download="{export_filename}_{data_name}.csv">📥 Download {data_name}.csv</a>'
+                    else:  # Excel
+                        excel_buffer = BytesIO()
+                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                            data_df.to_excel(writer, sheet_name=data_name[:31])
+                        excel_buffer.seek(0)
+                        b64 = base64.b64encode(excel_buffer.read()).decode()
+                        download_link = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{export_filename}_{data_name}.xlsx">📥 Download {data_name}.xlsx</a>'
+                    
+                    st.markdown(download_link, unsafe_allow_html=True)
             
-            st.success("Export completed successfully!")
-
-def fig_to_bytes(fig):
-    """Convert matplotlib figure to bytes for download"""
-    import io
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-    buf.seek(0)
-    return buf
+            st.success("Export files ready for download!")
 
 if __name__ == "__main__":
     main()
